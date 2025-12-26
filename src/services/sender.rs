@@ -1,30 +1,16 @@
-use crate::config;
-use aws_config::meta::region::RegionProviderChain;
-use aws_config::BehaviorVersion;
 use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
-use aws_sdk_sesv2::{config::Region, Client};
+use aws_sdk_sesv2::Client;
 
 /// send_email
 /// Send email using AWS SES
 /// Environment variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION are required for sending
 pub async fn send_email(
+    client: &Client,
     sender: &str,
     recipient: &str,
     subject: &str,
     body: &str,
 ) -> Result<String, aws_sdk_sesv2::Error> {
-    let envs = config::get_environments();
-    let aws_region = &envs.aws_region;
-    let region_provider = RegionProviderChain::first_try(Region::new(aws_region))
-        .or_default_provider()
-        .or_else(Region::new(aws_region));
-
-    let shared_config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
-        .load()
-        .await;
-
-    let client = Client::new(&shared_config);
     let message = Message::builder()
         .subject(
             Content::builder()

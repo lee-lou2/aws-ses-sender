@@ -7,10 +7,11 @@ mod services;
 mod state;
 mod tests;
 
+use aws_config::meta::region::RegionProviderChain;
+use aws_config::BehaviorVersion;
+use aws_sdk_sesv2::{config::Region, Client};
 use services::receiver::{receive_post_send_message, receive_send_message};
 use services::scheduler::schedule_pre_send_message;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -34,6 +35,18 @@ async fn main() -> Result<(), sqlx::Error> {
         .await
         .expect("Failed to create pool");
 
+    // Initialize AWS SES Client
+    let aws_region = &envs.aws_region;
+    let region_provider = RegionProviderChain::first_try(Region::new(aws_region.clone()))
+        .or_default_provider()
+        .or_else(Region::new(aws_region.clone()));
+
+    let shared_config = aws_config::defaults(BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
+    let client = Client::new(&shared_config);
+
     // Initialize channels
     let (tx_send, rx_send) = tokio::sync::mpsc::channel(10000);
     let (tx_post_send, rx_post_send) = tokio::sync::mpsc::channel(1000);
@@ -48,21 +61,17 @@ async fn main() -> Result<(), sqlx::Error> {
     });
 
     // Email sending
-    let arc_rx_send = Arc::new(Mutex::new(rx_send));
     tokio::spawn({
-        let cloned_arc_rx_send = Arc::clone(&arc_rx_send);
         async move {
-            receive_send_message(&cloned_arc_rx_send, &tx_post_send).await;
+            receive_send_message(client, rx_send, tx_post_send).await;
         }
     });
 
     // Postprocess email sending
-    let arc_rx_post_send = Arc::new(Mutex::new(rx_post_send));
     tokio::spawn({
-        let cloned_arc_rx_post_send = Arc::clone(&arc_rx_post_send);
         let db_pool = db_pool.clone();
         async move {
-            receive_post_send_message(&cloned_arc_rx_post_send, db_pool).await;
+            receive_post_send_message(rx_post_send, db_pool).await;
         }
     });
 
