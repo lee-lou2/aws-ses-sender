@@ -1,6 +1,5 @@
 //! AWS SES email sending service
 
-use crate::config;
 use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
 use aws_sdk_sesv2::{
     config::Region,
@@ -9,6 +8,8 @@ use aws_sdk_sesv2::{
 };
 use thiserror::Error;
 use tokio::sync::OnceCell;
+
+use crate::config;
 
 static SES_CLIENT: OnceCell<Client> = OnceCell::const_new();
 

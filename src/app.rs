@@ -1,12 +1,13 @@
 //! HTTP routing configuration
 
-use crate::{handlers, middlewares, state};
 use axum::{
     middleware::from_fn,
     routing::{delete, get, post},
     Router,
 };
 use tower_http::trace::TraceLayer;
+
+use crate::{handlers, middlewares, state};
 
 /// Creates the Axum router with all routes configured.
 pub fn app(state: state::AppState) -> Router {

@@ -1,10 +1,4 @@
-//! AWS SES Email Sender - High-performance bulk email service
-//!
-//! Features:
-//! - Rate-limited bulk email sending
-//! - Scheduled delivery support
-//! - Email open tracking
-//! - AWS SNS event handling (Bounce, Complaint, Delivery)
+//! High-performance bulk email service via AWS SES
 
 mod app;
 mod config;
@@ -15,11 +9,13 @@ mod services;
 mod state;
 mod tests;
 
-use services::receiver::{receive_post_send_message, receive_send_message};
-use services::scheduler::schedule_pre_send_message;
 use std::env;
+
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+use crate::services::receiver::{receive_post_send_message, receive_send_message};
+use crate::services::scheduler::schedule_pre_send_message;
 
 // Database pool configuration
 const DB_MAX_CONNECTIONS: u32 = 20;
@@ -99,6 +95,7 @@ async fn init_database() -> Result<sqlx::SqlitePool, Box<dyn std::error::Error>>
 }
 
 async fn apply_sqlite_optimizations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    // Journal and sync settings
     sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await?;
     sqlx::query("PRAGMA synchronous=NORMAL")
         .execute(pool)
@@ -106,15 +103,28 @@ async fn apply_sqlite_optimizations(pool: &sqlx::SqlitePool) -> Result<(), sqlx:
     sqlx::query("PRAGMA busy_timeout=5000")
         .execute(pool)
         .await?;
+
+    // Memory and cache settings
     sqlx::query("PRAGMA mmap_size=268435456")
         .execute(pool)
         .await?;
     sqlx::query("PRAGMA cache_size=-64000")
         .execute(pool)
         .await?;
+    sqlx::query("PRAGMA temp_store=MEMORY")
+        .execute(pool)
+        .await?;
+
+    // Storage optimization
+    sqlx::query("PRAGMA page_size=4096").execute(pool).await?;
+    sqlx::query("PRAGMA auto_vacuum=INCREMENTAL")
+        .execute(pool)
+        .await?;
+
+    // Integrity
     sqlx::query("PRAGMA foreign_keys=ON").execute(pool).await?;
 
-    info!("SQLite optimized: WAL, mmap=256MB, cache=64MB");
+    info!("SQLite optimized: WAL, mmap=256MB, cache=64MB, temp=MEMORY");
     Ok(())
 }
 

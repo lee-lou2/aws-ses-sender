@@ -1,8 +1,9 @@
 //! Email result model for tracking delivery events
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 
 /// Email delivery result (Bounce, Complaint, Delivery, Open, etc.)
 #[derive(Debug, Deserialize, Serialize)]
@@ -33,15 +34,18 @@ impl EmailResult {
     }
 
     /// Returns result counts by status for the specified topic.
+    ///
+    /// Uses JOIN instead of subquery for better performance.
     pub async fn get_result_counts_by_topic_id(
         db_pool: &SqlitePool,
         topic_id: &str,
     ) -> Result<HashMap<String, i32>, sqlx::Error> {
         let rows: Vec<(String, i32)> = sqlx::query_as(
-            "SELECT status, COUNT(DISTINCT request_id)
-             FROM email_results
-             WHERE request_id IN (SELECT id FROM email_requests WHERE topic_id = ?)
-             GROUP BY status",
+            "SELECT r.status, COUNT(DISTINCT r.request_id)
+             FROM email_results r
+             INNER JOIN email_requests req ON r.request_id = req.id
+             WHERE req.topic_id = ?
+             GROUP BY r.status",
         )
         .bind(topic_id)
         .fetch_all(db_pool)
@@ -96,6 +100,17 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        // 인덱스 추가
+        sqlx::query("CREATE INDEX idx_requests_topic_id ON email_requests(topic_id)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("CREATE INDEX idx_results_request_id ON email_results(request_id)")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         pool
     }
@@ -394,9 +409,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(counts_a.get("Delivery"), Some(&1));
-        assert!(counts_a.get("Bounce").is_none());
+        assert!(!counts_a.contains_key("Bounce"));
 
         assert_eq!(counts_b.get("Bounce"), Some(&1));
-        assert!(counts_b.get("Delivery").is_none());
+        assert!(!counts_b.contains_key("Delivery"));
     }
 }

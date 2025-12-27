@@ -1,9 +1,10 @@
 //! Email request model and database operations
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use std::collections::HashMap;
+
+use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 use tracing::debug;
 
 /// Max records per batch INSERT (`SQLite` variable limit: 999)
@@ -46,12 +47,20 @@ impl EmailMessageStatus {
 }
 
 /// Email request entity
+///
+/// - `content_id`: FK to `email_contents` table (for storage efficiency)
+/// - `subject`, `content`: Loaded at runtime via JOIN (not stored in this table)
 #[derive(Clone, Debug, Deserialize)]
 pub struct EmailRequest {
     pub id: Option<i32>,
     pub topic_id: Option<String>,
+    pub content_id: Option<i32>,
     pub email: String,
+    /// Loaded from `email_contents` at runtime (not stored in `email_requests`)
+    #[serde(default)]
     pub subject: String,
+    /// Loaded from `email_contents` at runtime (not stored in `email_requests`)
+    #[serde(default)]
     pub content: String,
     pub scheduled_at: Option<String>,
     pub status: i32,
@@ -61,19 +70,19 @@ pub struct EmailRequest {
 
 impl EmailRequest {
     /// Saves a single email request (use `save_batch` for bulk inserts).
+    /// Note: `content_id` must be set before calling this method.
     #[cfg(test)]
     pub async fn save(self, db_pool: &SqlitePool) -> Result<Self, sqlx::Error> {
         let scheduled_at = parse_scheduled_at(self.scheduled_at.as_deref());
 
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO email_requests (topic_id, email, subject, content, scheduled_at, status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            "INSERT INTO email_requests (topic_id, content_id, email, scheduled_at, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
              RETURNING id",
         )
         .bind(&self.topic_id)
+        .bind(self.content_id)
         .bind(&self.email)
-        .bind(&self.subject)
-        .bind(&self.content)
         .bind(&scheduled_at)
         .bind(self.status)
         .fetch_one(db_pool)
@@ -166,6 +175,7 @@ impl EmailRequest {
 
     /// Saves multiple requests in a single transaction using multi-row INSERT.
     ///
+    /// Note: `content_id` must be set for all requests before calling this method.
     /// This provides ~10x performance improvement over individual inserts.
     pub async fn save_batch(
         requests: Vec<Self>,
@@ -183,12 +193,12 @@ impl EmailRequest {
             let chunk_size = chunk.len();
 
             let placeholders = (0..chunk_size)
-                .map(|_| "(?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))")
+                .map(|_| "(?, ?, ?, ?, ?, datetime('now'), datetime('now'))")
                 .collect::<Vec<_>>()
                 .join(", ");
 
             let sql = format!(
-                "INSERT INTO email_requests (topic_id, email, subject, content, scheduled_at, status, created_at, updated_at) VALUES {placeholders}"
+                "INSERT INTO email_requests (topic_id, content_id, email, scheduled_at, status, created_at, updated_at) VALUES {placeholders}"
             );
 
             let mut query = sqlx::query(&sql);
@@ -197,9 +207,8 @@ impl EmailRequest {
                 let scheduled_at = parse_scheduled_at(req.scheduled_at.as_deref());
                 query = query
                     .bind(&req.topic_id)
+                    .bind(req.content_id)
                     .bind(&req.email)
-                    .bind(&req.subject)
-                    .bind(&req.content)
                     .bind(scheduled_at)
                     .bind(req.status);
             }
@@ -227,15 +236,22 @@ impl EmailRequest {
     }
 }
 
+/// Parses `scheduled_at` string and converts KST to UTC.
+///
+/// Input is expected to be in KST (Asia/Seoul, UTC+9) format: "YYYY-MM-DD HH:MM:SS"
+/// Returns UTC formatted string for `SQLite` datetime comparison.
 fn parse_scheduled_at(scheduled: Option<&str>) -> String {
     let now = Utc::now();
     let now_str = || now.format("%Y-%m-%d %H:%M:%S").to_string();
 
+    // KST is UTC+9
+    let kst = FixedOffset::east_opt(9 * 3600).expect("valid offset");
+
     match scheduled {
         Some(s) if !s.is_empty() => NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
             .ok()
-            .and_then(|dt| Local.from_local_datetime(&dt).single())
-            .map(|local: DateTime<Local>| local.with_timezone(&Utc))
+            .and_then(|dt| kst.from_local_datetime(&dt).single())
+            .map(|kst_dt| kst_dt.with_timezone(&Utc))
             .map_or_else(
                 || {
                     tracing::warn!("Invalid scheduled_at '{}', using now", s);
@@ -252,36 +268,62 @@ mod tests {
     use super::*;
     use regex::Regex;
 
-    fn convert_scheduled_at(scheduled: Option<&str>) -> String {
-        parse_scheduled_at(scheduled)
+    fn datetime_format_regex() -> Regex {
+        Regex::new(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$").unwrap()
     }
 
     #[test]
-    fn test_none_returns_valid_format() {
-        let result = convert_scheduled_at(None);
-        let re = Regex::new(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$").unwrap();
-        assert!(re.is_match(&result));
+    fn test_parse_scheduled_at_none_returns_valid_format() {
+        let result = parse_scheduled_at(None);
+        assert!(datetime_format_regex().is_match(&result));
     }
 
     #[test]
-    fn test_empty_string_returns_valid_format() {
-        let result = convert_scheduled_at(Some(""));
-        let re = Regex::new(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$").unwrap();
-        assert!(re.is_match(&result));
+    fn test_parse_scheduled_at_empty_returns_valid_format() {
+        let result = parse_scheduled_at(Some(""));
+        assert!(datetime_format_regex().is_match(&result));
     }
 
     #[test]
-    fn test_valid_datetime_converts() {
-        let input = "2023-10-12 15:30:45";
-        let result = convert_scheduled_at(Some(input));
-        let re = Regex::new(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$").unwrap();
-        assert!(re.is_match(&result));
+    fn test_parse_scheduled_at_invalid_uses_fallback() {
+        let result = parse_scheduled_at(Some("invalid"));
+        assert!(datetime_format_regex().is_match(&result));
     }
 
     #[test]
-    fn test_invalid_format_uses_fallback() {
-        let result = convert_scheduled_at(Some("invalid"));
-        let re = Regex::new(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$").unwrap();
-        assert!(re.is_match(&result));
+    fn test_parse_scheduled_at_kst_converts_to_utc() {
+        // KST 15:30:45 should become UTC 06:30:45 (9 hours earlier)
+        let kst_input = "2025-12-27 15:30:45";
+        let result = parse_scheduled_at(Some(kst_input));
+
+        assert_eq!(result, "2025-12-27 06:30:45");
+    }
+
+    #[test]
+    fn test_parse_scheduled_at_kst_midnight_crosses_date() {
+        // KST 2025-12-28 03:00:00 should become UTC 2025-12-27 18:00:00
+        let kst_input = "2025-12-28 03:00:00";
+        let result = parse_scheduled_at(Some(kst_input));
+
+        assert_eq!(result, "2025-12-27 18:00:00");
+    }
+
+    #[test]
+    fn test_parse_scheduled_at_kst_early_morning_previous_day() {
+        // KST 2025-01-01 08:00:00 should become UTC 2024-12-31 23:00:00
+        let kst_input = "2025-01-01 08:00:00";
+        let result = parse_scheduled_at(Some(kst_input));
+
+        assert_eq!(result, "2024-12-31 23:00:00");
+    }
+
+    #[test]
+    fn test_parse_scheduled_at_preserves_format() {
+        let kst_input = "2025-06-15 12:00:00";
+        let result = parse_scheduled_at(Some(kst_input));
+
+        // KST 12:00 -> UTC 03:00
+        assert_eq!(result, "2025-06-15 03:00:00");
+        assert!(datetime_format_regex().is_match(&result));
     }
 }

@@ -20,9 +20,13 @@ pub async fn api_key_auth(req: Request<Body>, next: Next) -> impl IntoResponse {
         return (StatusCode::UNAUTHORIZED, "Missing X-API-KEY header").into_response();
     };
 
+    if key.is_empty() {
+        return (StatusCode::UNAUTHORIZED, "Empty API Key").into_response();
+    }
+
     let expected_key = &crate::config::get_environments().api_key;
 
-    if key != expected_key {
+    if expected_key.is_empty() || key != expected_key {
         return (StatusCode::UNAUTHORIZED, "Invalid API Key").into_response();
     }
 

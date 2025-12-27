@@ -1,8 +1,9 @@
 //! Environment configuration module
 
+use std::env;
+
 use dotenv::dotenv;
 use once_cell::sync::Lazy;
-use std::env;
 
 /// Application configuration loaded from environment variables.
 #[derive(Debug)]
@@ -23,7 +24,13 @@ static ENVIRONMENTS: Lazy<Environment> = Lazy::new(|| {
     Environment {
         server_port: env::var("SERVER_PORT").unwrap_or_else(|_| "8080".to_owned()),
         server_url: env::var("SERVER_URL").unwrap_or_default(),
-        api_key: env::var("API_KEY").unwrap_or_default(),
+        api_key: env::var("API_KEY").unwrap_or_else(|_| {
+            if cfg!(test) {
+                "test-api-key-12345".to_owned()
+            } else {
+                String::new()
+            }
+        }),
         aws_region: env::var("AWS_REGION").unwrap_or_else(|_| "ap-northeast-2".to_owned()),
         aws_ses_from_email: env::var("AWS_SES_FROM_EMAIL").unwrap_or_default(),
         max_send_per_second: env::var("MAX_SEND_PER_SECOND")

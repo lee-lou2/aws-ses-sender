@@ -1,9 +1,5 @@
 //! Event tracking and SNS webhook handlers
 
-use crate::{
-    models::{request::EmailRequest, result::EmailResult},
-    state::AppState,
-};
 use axum::{
     extract::{Json, Query, Request, State},
     http::{header::HeaderValue, HeaderMap, StatusCode},
@@ -12,6 +8,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, info};
+
+use crate::{
+    models::{request::EmailRequest, result::EmailResult},
+    state::AppState,
+};
 
 const MAX_BODY_SIZE: usize = 1024 * 1024; // 1MB
 

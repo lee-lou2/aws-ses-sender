@@ -2,7 +2,9 @@
 mod tests {
     use crate::models::result::EmailResult;
     use crate::state::AppState;
-    use crate::tests::helpers::{get_api_key, setup_db};
+    use crate::tests::helpers::{
+        get_api_key, insert_default_content, insert_request_raw, insert_request_with_id, setup_db,
+    };
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use sqlx::Row;
@@ -32,14 +34,8 @@ mod tests {
     #[tokio::test]
     async fn test_open_creates_result() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at)
-             VALUES (1, 'topic', 'test@test.com', 'subject', 'content', datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(&db, 1, content_id, "topic", "test@test.com", 0, None).await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db.clone(), tx));
@@ -109,14 +105,8 @@ mod tests {
     #[tokio::test]
     async fn test_sent_count_returns_count() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (topic_id, email, subject, content, status, scheduled_at)
-             VALUES ('topic', 'test@test.com', 'subject', 'content', 2, datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        let content_id = insert_default_content(&db).await;
+        insert_request_raw(&db, content_id, "topic", "test@test.com", 2, None).await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db, tx));
@@ -147,14 +137,8 @@ mod tests {
     #[tokio::test]
     async fn test_email_result_save() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at)
-             VALUES (1, 'topic', 'test@test.com', 'subject', 'content', datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(&db, 1, content_id, "topic", "test@test.com", 0, None).await;
 
         let result = EmailResult {
             id: None,
@@ -218,14 +202,17 @@ mod tests {
     #[tokio::test]
     async fn test_sns_delivery_notification() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at, message_id)
-             VALUES (1, 'topic', 'test@test.com', 'subject', 'content', datetime('now'), 'ses-msg-123')",
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(
+            &db,
+            1,
+            content_id,
+            "topic",
+            "test@test.com",
+            0,
+            Some("ses-msg-123"),
         )
-        .execute(&db)
-        .await
-        .unwrap();
+        .await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db.clone(), tx));
@@ -268,14 +255,17 @@ mod tests {
     #[tokio::test]
     async fn test_sns_bounce_notification() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at, message_id)
-             VALUES (1, 'topic', 'bounce@test.com', 'subject', 'content', datetime('now'), 'ses-bounce-123')",
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(
+            &db,
+            1,
+            content_id,
+            "topic",
+            "bounce@test.com",
+            0,
+            Some("ses-bounce-123"),
         )
-        .execute(&db)
-        .await
-        .unwrap();
+        .await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db.clone(), tx));
@@ -373,14 +363,17 @@ mod tests {
     #[tokio::test]
     async fn test_sns_complaint_notification() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at, message_id)
-             VALUES (1, 'topic', 'complaint@test.com', 'subject', 'content', datetime('now'), 'ses-complaint-123')",
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(
+            &db,
+            1,
+            content_id,
+            "topic",
+            "complaint@test.com",
+            0,
+            Some("ses-complaint-123"),
         )
-        .execute(&db)
-        .await
-        .unwrap();
+        .await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db.clone(), tx));
@@ -423,14 +416,10 @@ mod tests {
     #[tokio::test]
     async fn test_sent_count_with_hours_param() {
         let db = setup_db().await;
+        let content_id = insert_default_content(&db).await;
 
-        sqlx::query(
-            "INSERT INTO email_requests (topic_id, email, subject, content, status, scheduled_at, created_at)
-             VALUES ('topic', 'test@test.com', 'subject', 'content', 2, datetime('now'), datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        // Insert with status = 2 (Sent)
+        insert_request_raw(&db, content_id, "topic", "test@test.com", 2, None).await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
         let app = crate::app::app(AppState::new(db, tx));
@@ -519,14 +508,8 @@ mod tests {
     #[tokio::test]
     async fn test_open_multiple_times() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at)
-             VALUES (1, 'topic', 'test@test.com', 'subject', 'content', datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(&db, 1, content_id, "topic", "test@test.com", 0, None).await;
 
         let (tx, _) = tokio::sync::mpsc::channel(1);
 
@@ -555,10 +538,11 @@ mod tests {
         .unwrap();
 
         // Should have 2 open records
-        let count: (i32,) = sqlx::query_as("SELECT COUNT(*) FROM email_results WHERE request_id = 1")
-            .fetch_one(&db)
-            .await
-            .unwrap();
+        let count: (i32,) =
+            sqlx::query_as("SELECT COUNT(*) FROM email_results WHERE request_id = 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert_eq!(count.0, 2);
     }
 
@@ -598,14 +582,8 @@ mod tests {
     #[tokio::test]
     async fn test_email_result_preserves_raw() {
         let db = setup_db().await;
-
-        sqlx::query(
-            "INSERT INTO email_requests (id, topic_id, email, subject, content, scheduled_at)
-             VALUES (1, 'topic', 'test@test.com', 'subject', 'content', datetime('now'))",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
+        let content_id = insert_default_content(&db).await;
+        insert_request_with_id(&db, 1, content_id, "topic", "test@test.com", 0, None).await;
 
         let raw_data = r#"{"detailed": "event data", "timestamp": "2024-01-01"}"#;
         let result = EmailResult {
@@ -624,6 +602,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(row.get::<Option<String>, _>("raw"), Some(raw_data.to_string()));
+        assert_eq!(
+            row.get::<Option<String>, _>("raw"),
+            Some(raw_data.to_string())
+        );
     }
 }

@@ -1,9 +1,5 @@
 //! Topic management handlers
 
-use crate::{
-    models::{request::EmailRequest, result::EmailResult},
-    state::AppState,
-};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -11,6 +7,11 @@ use axum::{
     Json,
 };
 use tracing::error;
+
+use crate::{
+    models::{request::EmailRequest, result::EmailResult},
+    state::AppState,
+};
 
 /// Returns email statistics for a specific topic.
 pub async fn get_topic(
