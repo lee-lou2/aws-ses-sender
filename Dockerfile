@@ -42,7 +42,7 @@ RUN useradd -r -s /bin/false appuser
 WORKDIR /app
 
 # 바이너리 복사
-COPY --from=builder /app/target/release/rust-aws-ses-sender ./
+COPY --from=builder /app/target/release/aws-ses-sender ./
 
 # 소유권 설정
 RUN chown -R appuser:appuser /app
@@ -54,4 +54,4 @@ USER appuser
 EXPOSE 3000
 
 # 실행
-CMD ["./rust-aws-ses-sender"]
+CMD ["./aws-ses-sender"]

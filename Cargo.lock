@@ -2194,7 +2194,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-aws-ses-sender"
+name = "aws-ses-sender"
 version = "0.1.0"
 dependencies = [
  "aws-config",

@@ -1,5 +1,5 @@
 [package]
-name = "rust-aws-ses-sender"
+name = "aws-ses-sender"
 version = "0.1.0"
 edition = "2021"
 description = "AWS SES를 통한 대량 이메일 발송 서비스"

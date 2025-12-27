@@ -1,5 +1,5 @@
 #!/bin/bash
-IMAGE_NAME="rust-aws-ses-sender"
+IMAGE_NAME="aws-ses-sender"
 IMAGE_TAG="latest"
 INTERNAL_SERVER_PORT=3000
 EXTERNAL_SERVER_PORT=3000

@@ -34,7 +34,7 @@ const POST_SEND_CHANNEL_BUFFER: usize = 1_000;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logger();
-    info!("Starting rust-aws-ses-sender...");
+    info!("Starting aws-ses-sender...");
 
     let envs = config::get_environments();
     let _sentry_guard = init_sentry(&envs.sentry_dsn);
