@@ -18,7 +18,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
     cargo build --release && \
-    rm -rf src target/release/deps/rust_aws_ses_sender*
+    rm -rf src target/release/deps/aws_ses_sender*
 
 # 실제 소스 복사 및 빌드
 COPY src ./src
