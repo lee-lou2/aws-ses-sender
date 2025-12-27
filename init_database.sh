@@ -62,7 +62,9 @@ CREATE INDEX idx_results_request_id ON email_results(request_id);
 -- status 인덱스: 이벤트 타입별 조회 최적화
 CREATE INDEX idx_results_status ON email_results(status);
 EOF
-  echo "Database initialized."
+  # Docker 컨테이너에서 접근 가능하도록 권한 설정
+  chmod 666 "$DB_FILE"
+  echo "Database initialized with permissions: $(stat -c '%a' "$DB_FILE" 2>/dev/null || stat -f '%A' "$DB_FILE")"
 else
   echo "Database file already exists."
 fi
