@@ -1,49 +1,39 @@
-use crate::handlers;
-use crate::middlewares;
-use crate::state;
-use axum::routing::delete;
+//! HTTP routing configuration
+
+use crate::{handlers, middlewares, state};
 use axum::{
     middleware::from_fn,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use tower_http::trace::TraceLayer;
 
-pub async fn app(state: state::AppState) -> Result<Router, sqlx::Error> {
-    // Configure router
-    let app = Router::new()
-        // Messages
+/// Creates the Axum router with all routes configured.
+pub fn app(state: state::AppState) -> Router {
+    let auth = from_fn(middlewares::auth_middlewares::api_key_auth);
+
+    Router::new()
         .route(
             "/v1/messages",
-            post(handlers::message_handlers::create_message_handler)
-                .layer(from_fn(middlewares::auth_middlewares::jwt_auth_middleware)),
-        )
-        // Topics
-        .route(
-            "/v1/topics/{topic_id}",
-            get(handlers::topic_handlers::retrieve_topic_handler)
-                .layer(from_fn(middlewares::auth_middlewares::jwt_auth_middleware)),
+            post(handlers::message_handlers::create_message).layer(auth.clone()),
         )
         .route(
             "/v1/topics/{topic_id}",
-            delete(handlers::topic_handlers::stop_topic_handler)
-                .layer(from_fn(middlewares::auth_middlewares::jwt_auth_middleware)),
+            get(handlers::topic_handlers::get_topic).layer(auth.clone()),
         )
-        // Events
         .route(
-            "/v1/events/open",
-            get(handlers::event_handlers::open_message_handler),
+            "/v1/topics/{topic_id}",
+            delete(handlers::topic_handlers::stop_topic).layer(auth.clone()),
         )
+        .route("/v1/events/open", get(handlers::event_handlers::track_open))
         .route(
             "/v1/events/counts/sent",
-            get(handlers::event_handlers::get_sent_count_handler)
-                .layer(from_fn(middlewares::auth_middlewares::jwt_auth_middleware)),
+            get(handlers::event_handlers::get_sent_count).layer(auth),
         )
         .route(
             "/v1/events/results",
-            post(handlers::event_handlers::create_event_handler),
+            post(handlers::event_handlers::handle_sns_event),
         )
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
-    Ok(app)
+        .layer(TraceLayer::new_for_http())
 }

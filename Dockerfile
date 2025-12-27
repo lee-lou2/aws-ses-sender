@@ -1,44 +1,57 @@
-# Build stage
-FROM rust:1.83 as builder
+# =============================================================================
+# Build Stage - Rust 빌드
+# =============================================================================
+FROM rust:1.83-slim-bookworm AS builder
 
-# Install necessary build dependencies
+# 빌드에 필요한 최소 의존성만 설치
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    apt-utils \
     pkg-config \
     libssl-dev \
-    perl \
-    libfindbin-libs-perl \
     && rm -rf /var/lib/apt/lists/*
 
-# OpenSSL configuration (use system OpenSSL during build)
-ENV OPENSSL_NO_VENDOR=1
+WORKDIR /app
 
-# Set working directory and copy source code
-WORKDIR /usr/src/app
+# 의존성 캐싱을 위해 Cargo 파일만 먼저 복사
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY .env ./
-COPY sqlite3.db ./
 
-# Build the app (release mode)
+# 더미 소스로 의존성만 빌드 (캐싱)
+RUN mkdir src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release && \
+    rm -rf src target/release/deps/rust_aws_ses_sender*
+
+# 실제 소스 복사 및 빌드
+COPY src ./src
 RUN cargo build --release
 
-# Runtime stage
+# =============================================================================
+# Runtime Stage - 최소 런타임 환경
+# =============================================================================
 FROM debian:bookworm-slim
 
-# Install runtime dependencies (only libssl3 is needed)
+# 런타임에 필요한 최소 의존성만 설치
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    apt-utils \
     libssl3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/cache/apt/*
 
-# Copy the binary generated in the build stage
-COPY --from=builder /usr/src/app/target/release/rust-aws-ses-sender /usr/local/bin/
-COPY --from=builder /usr/src/app/.env /app/
+# 비루트 사용자 생성 (보안)
+RUN useradd -r -s /bin/false appuser
 
-# Set working directory
 WORKDIR /app
 
-# Execution command
-CMD ["/usr/local/bin/rust-aws-ses-sender"]
+# 바이너리 복사
+COPY --from=builder /app/target/release/rust-aws-ses-sender ./
+
+# 소유권 설정
+RUN chown -R appuser:appuser /app
+
+# 비루트 사용자로 전환
+USER appuser
+
+# 포트 노출
+EXPOSE 3000
+
+# 실행
+CMD ["./rust-aws-ses-sender"]

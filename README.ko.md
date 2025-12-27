@@ -13,75 +13,90 @@ Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제�
 - 🔔 **Notification**: AWS SNS
 - 🔄 **Async Runtime**: Tokio
 - 💾 **Database**: SQLite
+- 🔒 **인증**: X-API-KEY 헤더
+- 📊 **모니터링**: Sentry + tracing
 
 ### 동작 방식
 
-#### 즉시 발송 프로세스
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  API Server │────▶│  Scheduler  │────▶│   Sender    │────▶│  AWS SES    │
+│   (Axum)    │     │  (Batch)    │     │ (Rate Limit)│     │             │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │                   │
+       │                   ▼                   ▼                   ▼
+       │            ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+       └───────────▶│   SQLite    │◀────│ Post-Proc   │◀────│   AWS SNS   │
+                    │   (WAL)     │     │  (Batch)    │     │  (Events)   │
+                    └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+#### 즉시 발송
 1. API 요청 수신 (`/v1/messages`)
-2. 데이터베이스에 발송 요청 저장
-3. Tokio 채널을 통해 발송기로 즉시 전달
-4. AWS SES 발송 속도 제한에 맞춰 순차 처리
-5. 발송 결과 비동기 저장
+2. **배치 INSERT**로 DB 저장 → 발송 채널로 전달
+3. Token Bucket + Semaphore 기반 Rate Limiting
+4. 결과 배치 업데이트 (트랜잭션당 100건)
 
-#### 예약 발송 프로세스
-1. API 요청 수신 (scheduled_at 포함)
-2. 데이터베이스에 예약 정보 저장
-3. 스케줄러가 1분 주기로 예약된 작업 확인
-4. 발송 시간이 된 메일을 발송기로 전달
-5. 즉시 발송과 동일한 프로세스로 처리
+#### 예약 발송
+1. API 요청 수신 (`scheduled_at` 포함)
+2. `Created` 상태로 저장
+3. 스케줄러가 10초마다 폴링, 발송 시간 된 메일 픽업
+4. 즉시 발송과 동일한 흐름으로 처리
 
-### 성능 최적화
-- Tokio 기반 비동기 런타임 활용
-- 경량 스레드로 리소스 사용 최소화
-- 채널 기반 효율적 태스크 분배
-- AWS SES 발송 속도 제한 자동 준수
+## ⚡ 성능 최적화
 
-![img.png](docs/process_diagram_ko.png)
+### Rate Limiting (Token Bucket + Semaphore)
+- **Token Bucket**: Atomic CAS 기반 정밀한 초당 속도 제어
+- **Semaphore**: 동시 네트워크 요청 제한 (rate limit의 2배)
+- **부드러운 리필**: 100ms마다 10%씩 균등 분배
+
+### 데이터베이스 (SQLite + WAL)
+- **WAL 모드**: 쓰기 중에도 동시 읽기 가능
+- **mmap**: 256MB 메모리 맵 I/O
+- **캐시**: 64MB 인메모리 캐시
+- **배치 INSERT**: 멀티-로우 INSERT로 **10배 이상** 성능 향상
+- **배치 업데이트**: 트랜잭션당 100건
+- **복합 인덱스**: 스케줄러 및 카운트 쿼리 최적화
+
+### 커넥션 풀링
+- **SES 클라이언트**: OnceCell로 단일 인스턴스 캐싱
+- **DB 풀**: 5-20개 연결, idle timeout 적용
+- **채널**: 발송 10,000개, 후처리 1,000개 버퍼
 
 ## ✨ 주요 기능
 
 - 🚀 대량 이메일 발송 및 예약 발송
 - 📊 실시간 발송 결과 모니터링
-- 👀 이메일 열람 추적
+- 👀 이메일 열람 추적 (1x1 픽셀)
 - ⏸ 대기 중인 이메일 발송 취소
-- 📈 발송 통계 및 결과 분석
+- 📈 토픽별 통계
+
+![img.png](docs/process_diagram_ko.png)
 
 ## 🔧 설정 가이드
 
 ### AWS SES 설정하기
 
-[👉 자세히 보기: 해당 블로그를 참고해주세요](https://lee-lou2.notion.site/19d4d6ae33b58092a019ee88de9ca8a0?pvs=4)
-
 #### 1️⃣ 샌드박스 모드 해제 (프로덕션 환경)
-- AWS SES는 기본적으로 샌드박스 모드로 시작
-- 프로덕션 환경을 위해 [AWS Support Center에서 샌드박스 해제 요청](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html) 필요
+- [AWS Support Center에서 샌드박스 해제 요청](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
 
 #### 2️⃣ 도메인 인증
 - AWS SES 콘솔에서 도메인 등록
-- DNS에 DKIM, SPF 레코드 추가 (제공된 레코드 사용)
-- 인증 완료까지 최대 72시간 소요
+- DNS에 DKIM, SPF 레코드 추가
 
 #### 3️⃣ 이메일 주소 인증 (샌드박스 모드)
 - AWS SES 콘솔에서 발신자 이메일 등록
-- 인증 이메일의 확인 링크로 인증 완료
 
 ### AWS SNS 설정하기 (선택사항)
 
 #### 1️⃣ SNS 주제 생성
 - AWS SNS 콘솔에서 새 주제 생성
-- 알림을 받을 주제 이름 설정
 
 #### 2️⃣ SES 이벤트 설정
-- SES Configuration Sets에서 새 설정 생성
-- SNS 이벤트 대상 추가
-    - 이벤트: Bounce, Complaint, Delivery
-    - 생성한 SNS 주제 연결
+- SNS 이벤트 대상 추가 (Bounce, Complaint, Delivery)
 
 #### 3️⃣ SNS 구독 설정
-- SNS 주제에 구독 추가 (HTTP/HTTPS, Email, SQS)
-- 구독 확인 절차 완료
-    - HTTP/HTTPS: 엔드포인트에서 확인 요청 처리
-    - Email: 확인 링크 클릭
+- 구독 추가 (HTTP/HTTPS 엔드포인트: `/v1/events/results`)
 
 ![img_1.png](docs/aws_diagram.png)
 
@@ -97,11 +112,26 @@ AWS_SES_FROM_EMAIL=your_verified_email
 # 서버 설정
 SERVER_URL=http://localhost:3000
 SERVER_PORT=3000
-DATABASE_URL=sqlite://sqlite3.db
-JWT_SECRET=your_secret_key  # Optional
-MAX_SEND_PER_SECOND=12
+API_KEY=your_api_key
+MAX_SEND_PER_SECOND=24
 
-SENTRY_DSN=your_sentry_dsn  # Optional
+# 선택사항
+SENTRY_DSN=your_sentry_dsn
+RUST_LOG=info
+```
+
+## 🚀 빠른 시작
+
+```bash
+# 데이터베이스 초기화
+./init_database.sh
+
+# 서버 실행
+cargo run --release
+
+# Docker로 실행
+docker build -t ses-sender .
+docker run -p 3000:3000 --env-file .env ses-sender
 ```
 
 ## 📡 API 가이드
@@ -110,70 +140,169 @@ SENTRY_DSN=your_sentry_dsn  # Optional
 
 ```http
 POST /v1/messages
+X-API-KEY: {your_api_key}
 ```
-
-대량 이메일 발송 및 예약 발송을 처리합니다.
 
 ```json
 {
   "messages": [
     {
-      "topic_id": "newsletter_2024_01",  // 커스텀 식별자
-      "emails": ["user@example.com"],
+      "topic_id": "newsletter_2024_01",
+      "emails": ["user1@example.com", "user2@example.com"],
       "subject": "1월 뉴스레터",
-      "content": "안녕하세요..."  // HTML 형식
+      "content": "<h1>안녕하세요!</h1><p>...</p>"
     }
   ],
-  "scheduled_at": "2024-01-01 09:00:00"  // 선택사항
+  "scheduled_at": "2024-01-01 09:00:00"
 }
 ```
 
-### 발송 결과 추적
-
-#### 📨 SNS 이벤트 수신
-```http
-POST /v1/events/results
+**응답:**
+```json
+{
+  "total": 2,
+  "success": 2,
+  "errors": 0,
+  "duration_ms": 45,
+  "scheduled": true
+}
 ```
-AWS SES로부터 실시간 발송 결과를 수신합니다:
-- ✅ Delivery: 발송 성공
-- ❌ Bounce: 발송 실패
-- ⚠️ Complaint: 스팸 신고
 
-#### 👁 이메일 열람 확인
-```http
-GET /v1/events/open?request_id={request_id}
+### 이벤트 추적
+
+| 엔드포인트 | 메서드 | 설명 |
+|----------|--------|-------------|
+| `/v1/events/open?request_id={id}` | GET | 이메일 열람 추적 (1x1 PNG 반환) |
+| `/v1/events/counts/sent?hours=24` | GET | 발송 건수 조회 (최근 N시간) |
+| `/v1/events/results` | POST | AWS SNS 이벤트 수신 |
+
+### 토픽 관리
+
+| 엔드포인트 | 메서드 | 설명 |
+|----------|--------|-------------|
+| `/v1/topics/{topic_id}` | GET | 토픽별 통계 조회 |
+| `/v1/topics/{topic_id}` | DELETE | 대기 중인 이메일 발송 취소 |
+
+## 🧪 테스트
+
+```bash
+# 전체 테스트 실행
+cargo test
+
+# 출력과 함께 실행
+cargo test -- --nocapture
+
+# 특정 테스트 실행
+cargo test test_save_batch
 ```
-1x1 투명 이미지를 통해 이메일 열람 여부를 추적합니다.
-- 이메일 본문 하단에 자동 포함
-- 이메일 열람 시 자동으로 서버에 기록
-- request_id로 개별 수신자 확인 가능
 
-### 모니터링 & 관리
+## 📊 모니터링
 
-#### 📊 발송 한도 확인
-```http
-GET /v1/events/counts/sent
+### 로그 레벨
+```bash
+RUST_LOG=debug cargo run  # 상세 로그
+RUST_LOG=info cargo run   # 일반 운영
+RUST_LOG=warn cargo run   # 경고만
 ```
-AWS SES 일일 발송 한도 및 잔여 수량을 확인합니다.
 
-#### 📈 토픽별 결과 조회
-```http
-GET /v1/topics/{topic_id}
+### 헬스 체크
+```bash
+curl http://localhost:3000/v1/events/counts/sent \
+  -H "X-API-KEY: $API_KEY"
 ```
-topic_id 기준으로 발송 결과를 집계합니다:
-- 총 발송 수
-- 성공/실패 수
-- 열람 수
 
-#### ⏹ 발송 취소
-```http
-DELETE /v1/topics/{topic_id}
+## 📁 프로젝트 구조
+
 ```
-대기 중인 이메일 발송을 취소합니다.
-- topic_id에 해당하는 모든 대기 메일 취소
-- 이미 발송된 메일은 취소 불가
+src/
+├── main.rs                 # 진입점, 초기화
+├── app.rs                  # 라우터 설정
+├── config.rs               # 환경변수 관리
+├── state.rs                # 애플리케이션 상태
+├── handlers/               # HTTP 요청 핸들러
+│   ├── message_handlers.rs # 이메일 발송 API
+│   ├── event_handlers.rs   # SNS 이벤트, 오픈 트래킹
+│   └── topic_handlers.rs   # 토픽 관리
+├── services/               # 백그라운드 서비스
+│   ├── scheduler.rs        # 예약 이메일 조회
+│   ├── receiver.rs         # Rate-limited 발송
+│   └── sender.rs           # AWS SES API 호출
+├── models/                 # 데이터 모델
+│   ├── request.rs          # EmailRequest, EmailMessageStatus
+│   └── result.rs           # EmailResult
+├── middlewares/            # HTTP 미들웨어
+│   └── auth_middlewares.rs # API Key 인증
+└── tests/                  # 단위 및 통합 테스트
+    ├── helpers (mod.rs)    # 공유 테스트 유틸리티
+    ├── auth_tests.rs
+    ├── event_tests.rs
+    ├── handler_tests.rs
+    ├── request_tests.rs
+    └── status_tests.rs
+```
+
+## 🛠 개발 가이드
+
+### 코드 스타일
+
+이 프로젝트는 Rust 공식 스타일 가이드를 따릅니다:
+
+```bash
+# 코드 포맷팅
+cargo fmt
+
+# 린터 실행
+cargo clippy
+
+# 모든 검사 실행
+cargo clippy -- -W clippy::all -W clippy::pedantic
+```
+
+**Lint 설정 (Cargo.toml):**
+```toml
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+```
+
+### 주요 의존성
+
+| 크레이트 | 용도 |
+|-------|---------|
+| `axum` | 웹 프레임워크 |
+| `tokio` | 비동기 런타임 |
+| `sqlx` | 데이터베이스 (SQLite) |
+| `aws-sdk-sesv2` | AWS SES API |
+| `serde` / `serde_json` | 직렬화 |
+| `thiserror` | 에러 처리 |
+| `tracing` | 로깅 |
+| `sentry` | 에러 트래킹 |
+
+### 빌드
+
+```bash
+# 개발 빌드
+cargo build
+
+# 릴리즈 빌드 (최적화)
+cargo build --release
+
+# 빌드 없이 검사만
+cargo check
+```
 
 ## 📚 참고 자료
 
 - [AWS SES 개발자 가이드](https://docs.aws.amazon.com/ses/latest/dg/Welcome.html)
 - [AWS SNS 개발자 가이드](https://docs.aws.amazon.com/sns/latest/dg/welcome.html)
+- [Axum 문서](https://docs.rs/axum)
+- [SQLx 문서](https://docs.rs/sqlx)
+- [Rust API 가이드라인](https://rust-lang.github.io/api-guidelines/)
+
+## 📄 라이선스
+
+MIT License

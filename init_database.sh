@@ -21,10 +21,17 @@ CREATE TABLE IF NOT EXISTS email_requests (
     deleted_at DATETIME
 );
 
-CREATE INDEX idx_requests_status ON email_requests(status);
-CREATE INDEX idx_requests_scheduled_at ON email_requests(scheduled_at DESC);
+-- 개별 인덱스: 특정 조회 최적화
 CREATE INDEX idx_requests_topic_id ON email_requests(topic_id);
-CREATE INDEX idx_email_requests_message_id ON email_requests(message_id);
+CREATE INDEX idx_requests_message_id ON email_requests(message_id);
+
+-- 복합 인덱스: 스케줄러 쿼리 최적화
+-- "WHERE status = ? AND scheduled_at <= datetime('now') ORDER BY scheduled_at ASC" 최적화
+CREATE INDEX idx_requests_status_scheduled ON email_requests(status, scheduled_at ASC);
+
+-- 복합 인덱스: 발송 건수 조회 최적화
+-- "WHERE status = ? AND created_at >= datetime('now', ?)" 최적화
+CREATE INDEX idx_requests_status_created ON email_requests(status, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS email_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

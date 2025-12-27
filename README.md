@@ -13,36 +13,63 @@ Built with Rust and Tokio for exceptional throughput and reliability.
 - 🔔 **Notification**: AWS SNS
 - 🔄 **Async Runtime**: Tokio
 - 💾 **Database**: SQLite
+- 🔒 **Auth**: X-API-KEY Header
+- 📊 **Monitoring**: Sentry + tracing
 
 ### How It Works
 
-#### Immediate Sending Process
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  API Server │────▶│  Scheduler  │────▶│   Sender    │────▶│  AWS SES    │
+│   (Axum)    │     │  (Batch)    │     │ (Rate Limit)│     │             │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+       │                   │                   │                   │
+       │                   ▼                   ▼                   ▼
+       │            ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+       └───────────▶│   SQLite    │◀────│ Post-Proc   │◀────│   AWS SNS   │
+                    │   (WAL)     │     │  (Batch)    │     │  (Events)   │
+                    └─────────────┘     └─────────────┘     └─────────────┘
+```
+
+#### Immediate Sending
 1. Receive API request (`/v1/messages`)
-2. Store sending request in database
-3. Immediately forward to sender via Tokio channel
-4. Process sequentially according to AWS SES sending rate limits
-5. Asynchronously store sending results
+2. **Batch INSERT** to DB → Forward to sender channel
+3. Rate-limited sending via Token Bucket + Semaphore
+4. Batch update results (100 per transaction)
 
-#### Scheduled Sending Process
-1. Receive API request (with scheduled_at)
-2. Store scheduling information in database
-3. Scheduler checks for scheduled tasks every minute
-4. Forward scheduled emails to sender when time comes
-5. Process using the same flow as immediate sending
+#### Scheduled Sending
+1. Receive API request (with `scheduled_at`)
+2. Store with `Created` status
+3. Scheduler polls every 10s, picks up due emails
+4. Same sending flow as immediate
 
-### Performance Optimization
-- Utilizing Tokio-based async runtime
-- Minimizing resource usage with lightweight threads
-- Efficient task distribution via channels
-- Automatic compliance with AWS SES sending rate limits
+## ⚡ Performance Optimizations
+
+### Rate Limiting (Token Bucket + Semaphore)
+- **Token Bucket**: Precise per-second rate control with atomic CAS
+- **Semaphore**: Limits concurrent network requests (2x rate limit)
+- **Smooth refill**: 10% tokens every 100ms for even distribution
+
+### Database (SQLite + WAL)
+- **WAL mode**: Concurrent reads during writes
+- **mmap**: 256MB memory-mapped I/O
+- **Cache**: 64MB in-memory cache
+- **Batch INSERT**: Multi-row INSERT provides **10x+** performance
+- **Batch updates**: 100 results per transaction
+- **Composite Indexes**: Optimized for scheduler and count queries
+
+### Connection Pooling
+- **SES Client**: Single cached instance (OnceCell)
+- **DB Pool**: 5-20 connections with idle timeout
+- **Channels**: 10,000 send buffer, 1,000 post-send buffer
 
 ## ✨ Key Features
 
 - 🚀 Bulk email sending and scheduling
 - 📊 Real-time delivery monitoring
-- 👀 Email open tracking
+- 👀 Email open tracking (1x1 pixel)
 - ⏸ Cancel pending email sends
-- 📈 Sending statistics and analysis
+- 📈 Per-topic statistics
 
 ![img_2.png](docs/process_diagram_en.png)
 
@@ -50,38 +77,26 @@ Built with Rust and Tokio for exceptional throughput and reliability.
 
 ### AWS SES Configuration
 
-[👉 See details: Refer to this blog](https://lee-lou2.notion.site/19d4d6ae33b58092a019ee88de9ca8a0?pvs=4)
-
 #### 1️⃣ Sandbox Mode Removal (Production)
-- AWS SES starts in sandbox mode by default
-- Request sandbox removal through [AWS Support Center](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html) for production use
+- Request sandbox removal through [AWS Support Center](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
 
 #### 2️⃣ Domain Authentication
 - Register domain in AWS SES console
-- Add DKIM and SPF records to DNS (using provided records)
-- Authentication may take up to 72 hours
+- Add DKIM and SPF records to DNS
 
 #### 3️⃣ Email Address Verification (Sandbox Mode)
 - Register sender email in AWS SES console
-- Complete verification via confirmation email link
 
 ### AWS SNS Configuration (Optional)
 
 #### 1️⃣ Create SNS Topic
 - Create new topic in AWS SNS console
-- Set topic name for notifications
 
 #### 2️⃣ SES Event Configuration
-- Create new configuration in SES Configuration Sets
-- Add SNS event destination
-   - Events: Bounce, Complaint, Delivery
-   - Link to created SNS topic
+- Add SNS event destination (Bounce, Complaint, Delivery)
 
 #### 3️⃣ SNS Subscription Setup
-- Add subscription to SNS topic (HTTP/HTTPS, Email, SQS)
-- Complete subscription confirmation
-   - HTTP/HTTPS: Handle confirmation request at endpoint
-   - Email: Click confirmation link
+- Add subscription (HTTP/HTTPS endpoint: `/v1/events/results`)
 
 ![img_1.png](docs/aws_diagram.png)
 
@@ -97,11 +112,26 @@ AWS_SES_FROM_EMAIL=your_verified_email
 # Server Configuration
 SERVER_URL=http://localhost:3000
 SERVER_PORT=3000
-DATABASE_URL=sqlite://sqlite3.db
-JWT_SECRET=your_secret_key  # Optional
-MAX_SEND_PER_SECOND=12
+API_KEY=your_api_key
+MAX_SEND_PER_SECOND=24
 
-SENTRY_DSN=your_sentry_dsn  # Optional
+# Optional
+SENTRY_DSN=your_sentry_dsn
+RUST_LOG=info
+```
+
+## 🚀 Quick Start
+
+```bash
+# Initialize database
+./init_database.sh
+
+# Run server
+cargo run --release
+
+# Or with Docker
+docker build -t ses-sender .
+docker run -p 3000:3000 --env-file .env ses-sender
 ```
 
 ## 📡 API Guide
@@ -110,70 +140,169 @@ SENTRY_DSN=your_sentry_dsn  # Optional
 
 ```http
 POST /v1/messages
+X-API-KEY: {your_api_key}
 ```
-
-Handle bulk email sending and scheduling.
 
 ```json
 {
   "messages": [
     {
-      "topic_id": "newsletter_2024_01",  // Custom identifier
-      "emails": ["user@example.com"],
+      "topic_id": "newsletter_2024_01",
+      "emails": ["user1@example.com", "user2@example.com"],
       "subject": "January Newsletter",
-      "content": "Hello..."  // HTML format
+      "content": "<h1>Hello!</h1><p>...</p>"
     }
   ],
-  "scheduled_at": "2024-01-01 09:00:00"  // Optional
+  "scheduled_at": "2024-01-01 09:00:00"
 }
 ```
 
-### Track Results
-
-#### 📨 SNS Event Reception
-```http
-POST /v1/events/results
+**Response:**
+```json
+{
+  "total": 2,
+  "success": 2,
+  "errors": 0,
+  "duration_ms": 45,
+  "scheduled": true
+}
 ```
-Receive real-time delivery results from AWS SES:
-- ✅ Delivery: Successfully sent
-- ❌ Bounce: Delivery failed
-- ⚠️ Complaint: Spam report
 
-#### 👁 Email Open Tracking
-```http
-GET /v1/events/open?request_id={request_id}
+### Event Tracking
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/events/open?request_id={id}` | GET | Track email opens (returns 1x1 PNG) |
+| `/v1/events/counts/sent?hours=24` | GET | Get sent count (last N hours) |
+| `/v1/events/results` | POST | Receive AWS SNS events |
+
+### Topic Management
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/topics/{topic_id}` | GET | Get topic statistics |
+| `/v1/topics/{topic_id}` | DELETE | Cancel pending emails |
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run specific test
+cargo test test_save_batch
 ```
-Track email opens using a 1x1 transparent image.
-- Automatically included at email bottom
-- Records opens on server automatically
-- Identify individual recipients via request_id
 
-### Monitoring & Management
+## 📊 Monitoring
 
-#### 📊 Check Sending Quota
-```http
-GET /v1/events/counts/sent
+### Log Levels
+```bash
+RUST_LOG=debug cargo run  # Detailed logs
+RUST_LOG=info cargo run   # Normal operation
+RUST_LOG=warn cargo run   # Warnings only
 ```
-Check AWS SES daily sending quota and remaining capacity.
 
-#### 📈 Topic Results
-```http
-GET /v1/topics/{topic_id}
+### Health Check
+```bash
+curl http://localhost:3000/v1/events/counts/sent \
+  -H "X-API-KEY: $API_KEY"
 ```
-Get aggregated results by topic_id:
-- Total sent
-- Success/failure count
-- Open count
 
-#### ⏹ Cancel Sending
-```http
-DELETE /v1/topics/{topic_id}
+## 📁 Project Structure
+
 ```
-Cancel pending email sends.
-- Cancels all pending emails for topic_id
-- Already sent emails cannot be cancelled
+src/
+├── main.rs                 # Entry point, initialization
+├── app.rs                  # Router configuration
+├── config.rs               # Environment variables
+├── state.rs                # Application state
+├── handlers/               # HTTP request handlers
+│   ├── message_handlers.rs # Email sending API
+│   ├── event_handlers.rs   # SNS events, open tracking
+│   └── topic_handlers.rs   # Topic management
+├── services/               # Background services
+│   ├── scheduler.rs        # Scheduled email pickup
+│   ├── receiver.rs         # Rate-limited sending
+│   └── sender.rs           # AWS SES API calls
+├── models/                 # Data models
+│   ├── request.rs          # EmailRequest, EmailMessageStatus
+│   └── result.rs           # EmailResult
+├── middlewares/            # HTTP middlewares
+│   └── auth_middlewares.rs # API key authentication
+└── tests/                  # Unit & integration tests
+    ├── helpers (mod.rs)    # Shared test utilities
+    ├── auth_tests.rs
+    ├── event_tests.rs
+    ├── handler_tests.rs
+    ├── request_tests.rs
+    └── status_tests.rs
+```
+
+## 🛠 Development Guide
+
+### Code Style
+
+This project follows the official Rust style guide:
+
+```bash
+# Format code
+cargo fmt
+
+# Run linter
+cargo clippy
+
+# Run with all checks
+cargo clippy -- -W clippy::all -W clippy::pedantic
+```
+
+**Lint Configuration (Cargo.toml):**
+```toml
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+```
+
+### Dependencies
+
+| Crate | Purpose |
+|-------|---------|
+| `axum` | Web framework |
+| `tokio` | Async runtime |
+| `sqlx` | Database (SQLite) |
+| `aws-sdk-sesv2` | AWS SES API |
+| `serde` / `serde_json` | Serialization |
+| `thiserror` | Error handling |
+| `tracing` | Logging |
+| `sentry` | Error tracking |
+
+### Building
+
+```bash
+# Development
+cargo build
+
+# Release (optimized)
+cargo build --release
+
+# Check without building
+cargo check
+```
 
 ## 📚 References
 
 - [AWS SES Developer Guide](https://docs.aws.amazon.com/ses/latest/dg/Welcome.html)
 - [AWS SNS Developer Guide](https://docs.aws.amazon.com/sns/latest/dg/welcome.html)
+- [Axum Documentation](https://docs.rs/axum)
+- [SQLx Documentation](https://docs.rs/sqlx)
+- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
+
+## 📄 License
+
+MIT License

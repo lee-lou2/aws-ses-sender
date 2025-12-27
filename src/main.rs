@@ -1,3 +1,11 @@
+//! AWS SES Email Sender - High-performance bulk email service
+//!
+//! Features:
+//! - Rate-limited bulk email sending
+//! - Scheduled delivery support
+//! - Email open tracking
+//! - AWS SNS event handling (Bounce, Complaint, Delivery)
+
 mod app;
 mod config;
 mod handlers;
@@ -9,81 +17,130 @@ mod tests;
 
 use services::receiver::{receive_post_send_message, receive_send_message};
 use services::scheduler::schedule_pre_send_message;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::env;
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+// Database pool configuration
+const DB_MAX_CONNECTIONS: u32 = 20;
+const DB_MIN_CONNECTIONS: u32 = 5;
+const DB_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const DB_IDLE_TIMEOUT_SECS: u64 = 300;
+
+// Channel buffer sizes
+const SEND_CHANNEL_BUFFER: usize = 10_000;
+const POST_SEND_CHANNEL_BUFFER: usize = 1_000;
 
 #[tokio::main]
-async fn main() -> Result<(), sqlx::Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logger();
+    info!("Starting rust-aws-ses-sender...");
+
     let envs = config::get_environments();
+    let _sentry_guard = init_sentry(&envs.sentry_dsn);
 
-    // Sentry Initialization
-    let sentry_dsn = &envs.sentry_dsn;
-    let _guard = sentry::init((
-        sentry_dsn.as_str(),
-        sentry::ClientOptions {
-            release: sentry::release_name!(),
-            ..Default::default()
-        },
-    ));
+    let db_pool = init_database().await?;
+    let (tx_send, rx_send) = tokio::sync::mpsc::channel(SEND_CHANNEL_BUFFER);
+    let (tx_post_send, rx_post_send) = tokio::sync::mpsc::channel(POST_SEND_CHANNEL_BUFFER);
 
-    // Initialize DB
-    let db_pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect("sqlite://sqlite3.db")
-        .await
-        .expect("Failed to create pool");
+    spawn_scheduler(tx_send.clone(), db_pool.clone());
+    spawn_email_sender(rx_send, tx_post_send);
+    spawn_post_processor(rx_post_send, db_pool.clone());
 
-    // Initialize channels
-    let (tx_send, rx_send) = tokio::sync::mpsc::channel(10000);
-    let (tx_post_send, rx_post_send) = tokio::sync::mpsc::channel(1000);
-    let cloned_tx_send = tx_send.clone();
+    let state = state::AppState::new(db_pool, tx_send);
+    let app = app::app(state);
 
-    // Preprocess email sending
-    tokio::spawn({
-        let db_pool = db_pool.clone();
-        async move {
-            schedule_pre_send_message(&tx_send, db_pool).await;
-        }
-    });
+    let port = &envs.server_port;
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    info!("Server running on http://0.0.0.0:{port}");
+    info!(
+        "Config: max_send/sec={}, db_pool={DB_MAX_CONNECTIONS}",
+        envs.max_send_per_second
+    );
 
-    // Email sending
-    let arc_rx_send = Arc::new(Mutex::new(rx_send));
-    tokio::spawn({
-        let cloned_arc_rx_send = Arc::clone(&arc_rx_send);
-        async move {
-            receive_send_message(&cloned_arc_rx_send, &tx_post_send).await;
-        }
-    });
+    axum::serve(listener, app).await?;
+    Ok(())
+}
 
-    // Postprocess email sending
-    let arc_rx_post_send = Arc::new(Mutex::new(rx_post_send));
-    tokio::spawn({
-        let cloned_arc_rx_post_send = Arc::clone(&arc_rx_post_send);
-        let db_pool = db_pool.clone();
-        async move {
-            receive_post_send_message(&cloned_arc_rx_post_send, db_pool).await;
-        }
-    });
-
-    let state = state::AppState::new(db_pool, cloned_tx_send);
-
-    // Initialize logger
+fn init_logger() {
+    let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_level(true),
+                .with_level(true)
+                .with_thread_ids(true),
         )
-        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level)))
         .init();
+}
 
-    let app = app::app(state).await?;
+fn init_sentry(dsn: &str) -> sentry::ClientInitGuard {
+    sentry::init((
+        dsn,
+        sentry::ClientOptions {
+            release: sentry::release_name!(),
+            ..Default::default()
+        },
+    ))
+}
 
-    // Start the server
-    let port = &envs.server_port;
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    println!("Server running on http://0.0.0.0:{}", port);
-    axum::serve(listener, app).await?;
+async fn init_database() -> Result<sqlx::SqlitePool, Box<dyn std::error::Error>> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(DB_MAX_CONNECTIONS)
+        .min_connections(DB_MIN_CONNECTIONS)
+        .acquire_timeout(std::time::Duration::from_secs(DB_ACQUIRE_TIMEOUT_SECS))
+        .idle_timeout(std::time::Duration::from_secs(DB_IDLE_TIMEOUT_SECS))
+        .connect("sqlite://sqlite3.db?mode=rwc")
+        .await?;
+
+    apply_sqlite_optimizations(&pool).await?;
+    Ok(pool)
+}
+
+async fn apply_sqlite_optimizations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await?;
+    sqlx::query("PRAGMA synchronous=NORMAL")
+        .execute(pool)
+        .await?;
+    sqlx::query("PRAGMA busy_timeout=5000")
+        .execute(pool)
+        .await?;
+    sqlx::query("PRAGMA mmap_size=268435456")
+        .execute(pool)
+        .await?;
+    sqlx::query("PRAGMA cache_size=-64000")
+        .execute(pool)
+        .await?;
+    sqlx::query("PRAGMA foreign_keys=ON").execute(pool).await?;
+
+    info!("SQLite optimized: WAL, mmap=256MB, cache=64MB");
     Ok(())
+}
+
+fn spawn_scheduler(
+    tx: tokio::sync::mpsc::Sender<models::request::EmailRequest>,
+    db: sqlx::SqlitePool,
+) {
+    tokio::spawn(async move {
+        schedule_pre_send_message(&tx, db).await;
+    });
+}
+
+fn spawn_email_sender(
+    rx: tokio::sync::mpsc::Receiver<models::request::EmailRequest>,
+    tx: tokio::sync::mpsc::Sender<models::request::EmailRequest>,
+) {
+    tokio::spawn(async move {
+        receive_send_message(rx, tx).await;
+    });
+}
+
+fn spawn_post_processor(
+    rx: tokio::sync::mpsc::Receiver<models::request::EmailRequest>,
+    db: sqlx::SqlitePool,
+) {
+    tokio::spawn(async move {
+        receive_post_send_message(rx, db).await;
+    });
 }

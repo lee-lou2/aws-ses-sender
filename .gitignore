@@ -1,4 +1,17 @@
 /target
 .idea
 .env
+
+# SQLite database files
 sqlite3.db
+sqlite3.db-shm
+sqlite3.db-wal
+
+# macOS
+.DS_Store
+
+# VS Code / Cursor
+.vscode/
+
+# Log files
+*.log
