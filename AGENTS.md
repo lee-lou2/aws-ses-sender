@@ -1,34 +1,36 @@
 # AGENTS.md
 
-> AI 코딩 에이전트를 위한 프로젝트 가이드
+> Project Guide for AI Coding Agents
 
 ---
 
-## 📋 프로젝트 개요
+## 📋 Project Overview
 
-**aws-ses-sender**는 AWS SES를 통한 고성능 대량 이메일 발송 서비스입니다.
+**aws-ses-sender** is a high-performance bulk email sending service powered by AWS SES.
 
-### 핵심 기능
-- 🚀 **대량 이메일 발송**: 요청당 최대 10,000개 이메일 처리
-- ⏰ **예약 발송**: `scheduled_at` 필드로 미래 시점 발송 예약
-- 📊 **이벤트 추적**: AWS SNS를 통한 Bounce/Complaint/Delivery 이벤트 수신
-- 👀 **오픈 트래킹**: 1x1 투명 픽셀을 통한 이메일 열람 추적
-- ⚡ **Rate Limiting**: Token Bucket + Semaphore 기반 초당 발송량 제어
+### Core Features
 
-### 기술 스택
-| 영역 | 기술 |
-|------|------|
-| 언어 | Rust 2021 Edition |
-| 웹 프레임워크 | Axum 0.8 |
-| 비동기 런타임 | Tokio |
-| 데이터베이스 | SQLite (WAL 모드) |
-| 이메일 서비스 | AWS SES v2 |
-| 인증 | X-API-KEY 헤더 |
-| 에러 트래킹 | Sentry |
+- 🚀 **Bulk Email Sending**: Up to 10,000 emails per request
+- ⏰ **Scheduled Delivery**: Future sending via `scheduled_at` field
+- 📊 **Event Tracking**: Bounce/Complaint/Delivery events via AWS SNS
+- 👀 **Open Tracking**: 1x1 transparent pixel for email open detection
+- ⚡ **Rate Limiting**: Token Bucket + Semaphore for per-second rate control
+
+### Tech Stack
+
+| Area | Technology |
+|------|------------|
+| Language | Rust 2021 Edition |
+| Web Framework | Axum 0.8 |
+| Async Runtime | Tokio |
+| Database | SQLite (WAL mode) |
+| Email Service | AWS SES v2 |
+| Authentication | X-API-KEY header |
+| Error Tracking | Sentry |
 
 ---
 
-## 🏗 아키텍처
+## 🏗 Architecture
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -43,171 +45,279 @@
                     └─────────────┘     └─────────────┘     └─────────────┘
 ```
 
-### 데이터 흐름
-1. **즉시 발송**: API → 배치 INSERT → 발송 채널 → Rate-limited 발송 → 결과 배치 업데이트
-2. **예약 발송**: API → 배치 INSERT (Created) → 스케줄러 폴링 → 발송 채널 → 발송 → 결과 업데이트
+### Data Flow
+
+1. **Immediate Sending**: API → Batch INSERT → Send Channel → Rate-limited Sending → Batch Result Update
+2. **Scheduled Sending**: API → Batch INSERT (Created) → Scheduler Polling → Send Channel → Sending → Result Update
+
+### Background Tasks (3 concurrent tasks)
+
+| Task | Function | Purpose |
+|------|----------|---------|
+| Scheduler | `schedule_pre_send_message` | Polls for scheduled emails every 10s |
+| Sender | `receive_send_message` | Rate-limited email sending via Token Bucket |
+| Post-Processor | `receive_post_send_message` | Batches and persists sending results |
 
 ---
 
-## 📁 프로젝트 구조
+## 📁 Project Structure
 
 ```
 src/
-├── main.rs                 # 진입점, 초기화, 백그라운드 태스크 스폰
-├── app.rs                  # Axum 라우터 설정
-├── config.rs               # 환경변수 로드 (싱글톤)
-├── state.rs                # AppState 정의 (DB 풀, 채널)
-├── handlers/               # HTTP 요청 핸들러
+├── main.rs                 # Entry point, initialization, background task spawning
+├── app.rs                  # Axum router configuration
+├── config.rs               # Environment variable loading (singleton)
+├── state.rs                # AppState definition (DB pool, channels)
+├── handlers/               # HTTP request handlers
 │   ├── mod.rs
 │   ├── message_handlers.rs # POST /v1/messages
 │   ├── event_handlers.rs   # GET/POST /v1/events/*
 │   └── topic_handlers.rs   # GET/DELETE /v1/topics/{id}
-├── services/               # 백그라운드 서비스
+├── services/               # Background services
 │   ├── mod.rs
-│   ├── scheduler.rs        # 예약 이메일 폴링 (10초 간격)
-│   ├── receiver.rs         # Rate-limited 발송 + 배치 DB 업데이트
-│   └── sender.rs           # AWS SES API 호출 (싱글톤 클라이언트)
-├── models/                 # 데이터 모델
+│   ├── scheduler.rs        # Scheduled email polling (10s interval)
+│   ├── receiver.rs         # Rate-limited sending + batch DB updates
+│   └── sender.rs           # AWS SES API calls (singleton client)
+├── models/                 # Data models
 │   ├── mod.rs
+│   ├── content.rs          # Email content model
 │   ├── request.rs          # EmailRequest, EmailMessageStatus
 │   └── result.rs           # EmailResult
-├── middlewares/            # HTTP 미들웨어
+├── middlewares/            # HTTP middlewares
 │   ├── mod.rs
-│   └── auth_middlewares.rs # API Key 인증
-└── tests/                  # 테스트
-    ├── mod.rs              # 공유 헬퍼 함수
-    ├── auth_tests.rs
-    ├── event_tests.rs
-    ├── handler_tests.rs
-    ├── request_tests.rs
-    └── status_tests.rs
+│   └── auth_middlewares.rs # API Key authentication
+└── tests/                  # Test modules
+    ├── mod.rs              # Shared helper functions
+    ├── auth_tests.rs       # Authentication tests
+    ├── event_tests.rs      # Event handler tests
+    ├── handler_tests.rs    # Message/topic handler tests
+    ├── request_tests.rs    # EmailRequest model tests
+    └── status_tests.rs     # EmailMessageStatus enum tests
 ```
 
 ---
 
-## 🔑 핵심 모듈
+## 🔑 Core Modules
 
 ### `src/main.rs`
-- 애플리케이션 진입점
-- 로거, Sentry, DB 초기화
-- 3개의 백그라운드 태스크 스폰
+
+Entry point and initialization:
+- Logger and Sentry setup
+- Database pool creation with SQLite optimizations
+- Channel creation for inter-task communication
+- Spawning 3 background tasks
+
+Key constants:
+```rust
+const DB_MAX_CONNECTIONS: u32 = 20;
+const DB_MIN_CONNECTIONS: u32 = 5;
+const SEND_CHANNEL_BUFFER: usize = 10_000;
+const POST_SEND_CHANNEL_BUFFER: usize = 1_000;
+```
 
 ### `src/services/receiver.rs`
-**가장 복잡한 모듈** - Rate limiting과 동시성 제어 담당
+
+**Most complex module** - handles rate limiting and concurrency control.
 
 ```rust
-// Token Bucket: 초당 발송량 제어
+// Token Bucket: per-second rate control
 let tokens = Arc::new(AtomicU64::new(max_per_sec));
 
-// Semaphore: 동시 요청 수 제한 (max_per_sec * 2)
+// Semaphore: concurrent request limit (max_per_sec * 2)
 let semaphore = Arc::new(Semaphore::new(max_per_sec * 2));
 ```
 
+Key constants:
+```rust
+const TOKEN_REFILL_INTERVAL_MS: u64 = 100;  // 10% refill every 100ms
+const TOKEN_WAIT_INTERVAL_MS: u64 = 5;       // Wait between token checks
+const BATCH_SIZE: usize = 100;               // Results per batch update
+const BATCH_FLUSH_INTERVAL_MS: u64 = 500;    // Max wait before flush
+```
+
+### `src/services/scheduler.rs`
+
+Polls for scheduled emails and forwards to sending queue:
+```rust
+const BATCH_SIZE: i32 = 1000;        // Records per poll
+const IDLE_DELAY_SECS: u64 = 10;     // Delay when no messages
+const ERROR_BACKOFF_SECS: u64 = 5;   // Delay after error
+```
+
 ### `src/models/request.rs`
+
 ```rust
 pub enum EmailMessageStatus {
-    Created = 0,    // 생성됨 (예약 발송 대기)
-    Processed = 1,  // 처리됨 (발송 큐에 등록)
-    Sent = 2,       // 발송 완료
-    Failed = 3,     // 발송 실패
-    Stopped = 4,    // 발송 중단됨
+    Created = 0,    // Created (waiting for scheduled time)
+    Processed = 1,  // Processed (added to send queue)
+    Sent = 2,       // Successfully sent
+    Failed = 3,     // Send failed
+    Stopped = 4,    // Cancelled by user
+}
+```
+
+Key constant:
+```rust
+const BATCH_INSERT_SIZE: usize = 100;  // Max rows per multi-row INSERT
+```
+
+---
+
+## 🗄 Database Schema
+
+### `email_requests` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER PK | Auto-increment ID |
+| topic_id | VARCHAR(255) | Group sending identifier |
+| message_id | VARCHAR(255) | AWS SES message ID |
+| email | VARCHAR(255) | Recipient email address |
+| subject | VARCHAR(255) | Email subject |
+| content | TEXT | HTML body |
+| scheduled_at | DATETIME | Scheduled send time (UTC) |
+| status | TINYINT | EmailMessageStatus value |
+| error | VARCHAR(255) | Error message (if failed) |
+| created_at | DATETIME | Creation timestamp |
+| updated_at | DATETIME | Last update timestamp |
+
+### `email_results` Table
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER PK | Auto-increment ID |
+| request_id | INTEGER FK | References email_requests.id |
+| status | VARCHAR(50) | Event type (Open, Bounce, Complaint, Delivery) |
+| raw | TEXT | Original SNS JSON payload |
+| created_at | DATETIME | Creation timestamp |
+
+### Indexes
+
+```sql
+CREATE INDEX idx_requests_status ON email_requests(status);
+CREATE INDEX idx_requests_topic_id ON email_requests(topic_id);
+CREATE INDEX idx_requests_scheduled ON email_requests(status, scheduled_at);
+```
+
+---
+
+## 🌐 API Endpoints
+
+| Method | Path | Auth | Handler | Description |
+|--------|------|------|---------|-------------|
+| POST | `/v1/messages` | ✅ | `create_message` | Send emails (immediate or scheduled) |
+| GET | `/v1/topics/{topic_id}` | ✅ | `get_topic` | Get topic statistics |
+| DELETE | `/v1/topics/{topic_id}` | ✅ | `stop_topic` | Cancel pending emails |
+| GET | `/v1/events/open` | ❌ | `track_open` | Track email opens (returns 1x1 PNG) |
+| GET | `/v1/events/counts/sent` | ✅ | `get_sent_count` | Get sent count (last N hours) |
+| POST | `/v1/events/results` | ❌ | `handle_sns_event` | Receive AWS SNS events |
+
+### Request/Response Examples
+
+**POST /v1/messages**
+```json
+// Request
+{
+  "messages": [
+    {
+      "topic_id": "newsletter_2024_01",
+      "emails": ["user1@example.com", "user2@example.com"],
+      "subject": "January Newsletter",
+      "content": "<h1>Hello!</h1><p>...</p>"
+    }
+  ],
+  "scheduled_at": "2024-01-01 09:00:00"
+}
+
+// Response
+{
+  "total": 2,
+  "success": 2,
+  "errors": 0,
+  "duration_ms": 45,
+  "scheduled": true
+}
+```
+
+**GET /v1/topics/{topic_id}**
+```json
+// Response
+{
+  "request_counts": {
+    "Created": 100,
+    "Sent": 850,
+    "Failed": 5
+  },
+  "result_counts": {
+    "Open": 423,
+    "Bounce": 3,
+    "Delivery": 847
+  }
 }
 ```
 
 ---
 
-## 🗄 데이터베이스 스키마
+## ⚙️ Environment Variables
 
-### `email_requests` 테이블
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | INTEGER PK | 자동 증가 ID |
-| topic_id | VARCHAR(255) | 그룹 발송 식별자 |
-| message_id | VARCHAR(255) | AWS SES 메시지 ID |
-| email | VARCHAR(255) | 수신자 이메일 |
-| subject | VARCHAR(255) | 제목 |
-| content | TEXT | HTML 본문 |
-| scheduled_at | DATETIME | 예약 발송 시간 |
-| status | TINYINT | EmailMessageStatus 값 |
-| error | VARCHAR(255) | 에러 메시지 |
-| created_at | DATETIME | 생성 시간 |
-| updated_at | DATETIME | 수정 시간 |
-
-### `email_results` 테이블
-| 컬럼 | 타입 | 설명 |
-|------|------|------|
-| id | INTEGER PK | 자동 증가 ID |
-| request_id | INTEGER FK | email_requests.id 참조 |
-| status | VARCHAR(50) | 이벤트 유형 |
-| raw | TEXT | 원본 SNS JSON |
-| created_at | DATETIME | 생성 시간 |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SERVER_PORT` | ❌ | 8080 | Server port |
+| `SERVER_URL` | ✅ | - | External access URL (for tracking pixel) |
+| `API_KEY` | ✅ | - | API authentication key |
+| `AWS_REGION` | ❌ | ap-northeast-2 | AWS region |
+| `AWS_SES_FROM_EMAIL` | ✅ | - | Sender email address |
+| `MAX_SEND_PER_SECOND` | ❌ | 24 | Max emails per second |
+| `SENTRY_DSN` | ❌ | - | Sentry DSN for error tracking |
+| `RUST_LOG` | ❌ | info | Log level (debug, info, warn, error) |
 
 ---
 
-## 🌐 API 엔드포인트
+## 🔧 Development Environment
 
-| 메서드 | 경로 | 인증 | 핸들러 함수 |
-|--------|------|------|-------------|
-| POST | `/v1/messages` | ✅ | `create_message` |
-| GET | `/v1/topics/{topic_id}` | ✅ | `get_topic` |
-| DELETE | `/v1/topics/{topic_id}` | ✅ | `stop_topic` |
-| GET | `/v1/events/open` | ❌ | `track_open` |
-| GET | `/v1/events/counts/sent` | ✅ | `get_sent_count` |
-| POST | `/v1/events/results` | ❌ | `handle_sns_event` |
-
----
-
-## ⚙️ 환경변수
-
-| 변수 | 필수 | 기본값 | 설명 |
-|------|------|--------|------|
-| `SERVER_PORT` | ❌ | 8080 | 서버 포트 |
-| `SERVER_URL` | ✅ | - | 외부 접근 URL |
-| `API_KEY` | ✅ | - | API 인증 키 |
-| `AWS_REGION` | ❌ | ap-northeast-2 | AWS 리전 |
-| `AWS_SES_FROM_EMAIL` | ✅ | - | 발신자 이메일 |
-| `MAX_SEND_PER_SECOND` | ❌ | 24 | 초당 최대 발송량 |
-| `SENTRY_DSN` | ❌ | - | Sentry DSN |
-| `RUST_LOG` | ❌ | info | 로그 레벨 |
-
----
-
-## 🔧 개발 환경
-
-### 빌드 및 실행
+### Build & Run
 
 ```bash
-# 개발 모드
+# Development mode
 cargo run
 
-# 릴리즈 모드
+# Release mode
 cargo run --release
 
-# 테스트
+# Run tests
 cargo test
 
-# 린팅
+# Run tests with output
+cargo test -- --nocapture
+
+# Linting
 cargo clippy
+
+# Formatting
 cargo fmt
 ```
 
-### 주요 상수
+### Key Constants Summary
 
-| 상수 | 값 | 위치 |
-|------|-----|------|
-| `DB_MAX_CONNECTIONS` | 20 | main.rs |
-| `SEND_CHANNEL_BUFFER` | 10,000 | main.rs |
-| `BATCH_SIZE` (scheduler) | 1,000 | scheduler.rs |
-| `BATCH_INSERT_SIZE` | 100 | request.rs |
-| `BATCH_FLUSH_INTERVAL_MS` | 500 | receiver.rs |
+| Constant | Value | Location | Purpose |
+|----------|-------|----------|---------|
+| `DB_MAX_CONNECTIONS` | 20 | main.rs | Max database connections |
+| `DB_MIN_CONNECTIONS` | 5 | main.rs | Min database connections |
+| `SEND_CHANNEL_BUFFER` | 10,000 | main.rs | Send queue buffer size |
+| `POST_SEND_CHANNEL_BUFFER` | 1,000 | main.rs | Post-send queue buffer |
+| `BATCH_SIZE` (scheduler) | 1,000 | scheduler.rs | Emails per scheduler poll |
+| `BATCH_INSERT_SIZE` | 100 | request.rs | Rows per multi-row INSERT |
+| `BATCH_SIZE` (receiver) | 100 | receiver.rs | Results per batch update |
+| `BATCH_FLUSH_INTERVAL_MS` | 500 | receiver.rs | Max flush wait time |
+| `MAX_EMAILS_PER_REQUEST` | 10,000 | message_handlers.rs | API request limit |
 
 ---
 
-## 📝 Rust 코드 스타일 가이드
+## 📝 Rust Code Style Guide
 
-> 이 프로젝트는 [Rust 공식 스타일 가이드](https://doc.rust-lang.org/stable/style-guide/)와 [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)를 따릅니다.
+> This project follows the [Rust Style Guide](https://doc.rust-lang.org/stable/style-guide/) and [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
 
-### Lint 설정
+### Lint Configuration
 
 ```toml
 [lints.rust]
@@ -219,61 +329,55 @@ pedantic = "warn"
 nursery = "warn"
 ```
 
-### 네이밍 컨벤션
+### Naming Conventions
 
-| 항목 | 스타일 | 예시 |
-|------|--------|------|
-| 크레이트/모듈 | `snake_case` | `email_sender`, `auth_middlewares` |
-| 타입/트레이트 | `PascalCase` | `EmailRequest`, `SendEmailError` |
-| 함수/메서드 | `snake_case` | `send_email`, `get_topic` |
-| 상수 | `SCREAMING_SNAKE_CASE` | `MAX_EMAILS_PER_REQUEST`, `BATCH_SIZE` |
-| 변수/파라미터 | `snake_case` | `db_pool`, `topic_id` |
-| 라이프타임 | 짧은 소문자 | `'a`, `'de` |
-| 타입 파라미터 | 단일 대문자 또는 `PascalCase` | `T`, `E`, `Item` |
+| Item | Style | Examples |
+|------|-------|----------|
+| Crates/Modules | `snake_case` | `email_sender`, `auth_middlewares` |
+| Types/Traits | `PascalCase` | `EmailRequest`, `SendEmailError` |
+| Functions/Methods | `snake_case` | `send_email`, `get_topic` |
+| Constants | `SCREAMING_SNAKE_CASE` | `MAX_EMAILS_PER_REQUEST`, `BATCH_SIZE` |
+| Variables/Parameters | `snake_case` | `db_pool`, `topic_id` |
+| Lifetimes | Short lowercase | `'a`, `'de` |
+| Type Parameters | Single uppercase or `PascalCase` | `T`, `E`, `Item` |
 
-### 모듈 문서 주석
+### Module Documentation
 
 ```rust
-// ✅ Good: 한 줄로 간결하게
+// ✅ Good: Single line, concise
 //! Email request model and database operations
 
-// ❌ Bad: 불필요하게 길고 장황한 설명
-//! 이 모듈은 이메일 요청 모델과 데이터베이스 작업을 담당합니다.
+// ❌ Bad: Unnecessarily verbose
+//! This module handles email request models and database operations.
 //! 
-//! ## 주요 기능
-//! - 이메일 요청 저장
-//! - 이메일 요청 조회
+//! ## Features
+//! - Save email requests
+//! - Query email requests
 //! ...
 ```
 
-### 함수 문서 주석
+### Function Documentation
 
 ```rust
-// ✅ Good: 필요한 경우에만 간결하게
+// ✅ Good: Concise, only when needed
 /// Saves multiple requests in a single transaction using multi-row INSERT.
 ///
-/// This provides ~10x performance improvement over individual inserts.
+/// Provides ~10x performance improvement over individual inserts.
 pub async fn save_batch(requests: Vec<Self>, db_pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error>
 
-// ✅ Good: 단순한 함수는 문서 생략 가능
+// ✅ Good: Simple functions can omit documentation
 pub async fn update(&self, db_pool: &SqlitePool) -> Result<(), sqlx::Error>
 
-// ❌ Bad: 코드에서 명백한 내용을 반복
-/// This function updates the email request in the database
-/// It takes a database pool and updates the request
+// ❌ Bad: Repeating what's obvious from the code
+/// This function updates the email request in the database.
+/// It takes a database pool and updates the request.
 pub async fn update(&self, db_pool: &SqlitePool) -> Result<(), sqlx::Error>
 ```
 
-### 구분선 주석 금지
+### Comments
 
 ```rust
-// ❌ Bad: 구분선 주석 사용
-// =============================================================================
-// Configuration
-// =============================================================================
-const BATCH_SIZE: usize = 100;
-
-// ✅ Good: 관련 상수를 그룹으로 배치 (공백으로 구분)
+// ✅ Good: Group related constants with minimal comments
 // Token bucket configuration
 const TOKEN_REFILL_INTERVAL_MS: u64 = 100;
 const TOKEN_WAIT_INTERVAL_MS: u64 = 5;
@@ -281,12 +385,18 @@ const TOKEN_WAIT_INTERVAL_MS: u64 = 5;
 // Batch update configuration
 const BATCH_SIZE: usize = 100;
 const BATCH_FLUSH_INTERVAL_MS: u64 = 500;
+
+// ❌ Bad: Separator comments
+// =============================================================================
+// Configuration
+// =============================================================================
+const BATCH_SIZE: usize = 100;
 ```
 
-### Import 정리
+### Import Organization
 
 ```rust
-// ✅ Good: 표준 라이브러리 → 외부 크레이트 → 내부 모듈 순서
+// ✅ Good: std → external crates → internal modules
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -298,10 +408,10 @@ use crate::models::request::EmailRequest;
 use crate::state::AppState;
 ```
 
-### 에러 처리
+### Error Handling
 
 ```rust
-// ✅ Good: thiserror 사용
+// ✅ Good: Use thiserror for custom errors
 #[derive(Debug, Error)]
 pub enum SendEmailError {
     #[error("Failed to build email: {0}")]
@@ -311,69 +421,59 @@ pub enum SendEmailError {
     Sdk(String),
 }
 
-// ✅ Good: let-else 패턴 활용
+// ✅ Good: Use let-else for early returns
 let Some(ses_msg_id) = ses_msg_id else {
     error!("SES message_id not found");
     return (StatusCode::BAD_REQUEST, "Not found").into_response();
 };
 
-// ✅ Good: ? 연산자 활용
+// ✅ Good: Use ? operator for propagation
 let row: (i64,) = sqlx::query_as("SELECT id FROM ...")
     .bind(message_id)
     .fetch_one(db_pool)
     .await?;
 ```
 
-### 조건부 컴파일
+### Type Conversions
 
 ```rust
-// ✅ Good: 테스트 전용 함수
-#[cfg(test)]
-pub async fn save(self, db_pool: &SqlitePool) -> Result<Self, sqlx::Error> {
-    // 테스트에서만 사용되는 개별 저장 로직
-}
-```
-
-### 타입 변환
-
-```rust
-// ✅ Good: 명시적 캐스팅과 allow 속성
+// ✅ Good: Explicit casting with allow attribute
 #[allow(clippy::cast_possible_truncation)]
 let id = row.0 as i32;
 
-// ✅ Good: 안전한 변환
+// ✅ Good: Safe conversion with fallback
 let max_per_sec = u64::try_from(envs.max_send_per_second.max(1)).unwrap_or(1);
 ```
 
-### 핸들러 함수 네이밍
+### Handler Function Naming
 
 ```rust
-// ✅ Good: 동사로 시작하는 간결한 이름
+// ✅ Good: Verb-first, concise names
 pub async fn create_message(...) -> impl IntoResponse
 pub async fn get_topic(...) -> impl IntoResponse
 pub async fn stop_topic(...) -> impl IntoResponse
 pub async fn track_open(...) -> impl IntoResponse
 pub async fn handle_sns_event(...) -> impl IntoResponse
 
-// ❌ Bad: 불필요한 접미사
+// ❌ Bad: Unnecessary suffixes
 pub async fn create_message_handler(...) -> impl IntoResponse
 pub async fn retrieve_topic_handler(...) -> impl IntoResponse
 ```
 
-### 미들웨어 네이밍
+### Middleware Naming
 
 ```rust
-// ✅ Good: 간결한 이름
+// ✅ Good: Concise name
 pub async fn api_key_auth(req: Request<Body>, next: Next) -> impl IntoResponse
 
-// ❌ Bad: 불필요한 접미사
+// ❌ Bad: Unnecessary suffix
 pub async fn api_key_auth_middleware(req: Request<Body>, next: Next) -> impl IntoResponse
 ```
 
-### 상수 정의
+### Constant Definitions
 
 ```rust
-// ✅ Good: 관련 상수는 모듈 상단에 그룹으로
+// ✅ Good: Group related constants at module top
 const MAX_BODY_SIZE: usize = 1024 * 1024; // 1MB
 
 /// 1x1 transparent PNG for email open tracking
@@ -381,16 +481,60 @@ const TRACKING_PIXEL: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, ...
 ];
 
-// ✅ Good: 주석은 필요할 때만
+// ✅ Good: Comments only when needed
 const DB_MAX_CONNECTIONS: u32 = 20;
 const DB_MIN_CONNECTIONS: u32 = 5;
 ```
 
+### Conditional Compilation
+
+```rust
+// ✅ Good: Test-only functions
+#[cfg(test)]
+pub async fn save(self, db_pool: &SqlitePool) -> Result<Self, sqlx::Error> {
+    // Individual save logic used only in tests
+}
+```
+
+### Async Patterns
+
+```rust
+// ✅ Good: Use tokio::spawn for background tasks
+tokio::spawn(async move {
+    schedule_pre_send_message(&tx, db).await;
+});
+
+// ✅ Good: Use channels for inter-task communication
+let (tx_send, rx_send) = tokio::sync::mpsc::channel(SEND_CHANNEL_BUFFER);
+
+// ✅ Good: Use Arc for shared state
+let tokens = Arc::new(AtomicU64::new(max_per_sec));
+```
+
+### SQL Queries
+
+```rust
+// ✅ Good: Multi-line SQL for readability
+let rows: Vec<ScheduledEmailRow> = sqlx::query_as(
+    "SELECT id, topic_id, email, subject, content
+     FROM email_requests
+     WHERE status = ? AND scheduled_at <= datetime('now')
+     ORDER BY scheduled_at ASC
+     LIMIT ?",
+)
+.bind(EmailMessageStatus::Created as i32)
+.bind(BATCH_SIZE)
+.fetch_all(db_pool)
+.await?;
+
+// ✅ Good: Use named columns, avoid SELECT *
+```
+
 ---
 
-## 🧪 테스트 코드 스타일 가이드
+## 🧪 Test Code Style Guide
 
-### 테스트 파일 구조
+### Test File Structure
 
 ```rust
 #[cfg(test)]
@@ -399,13 +543,13 @@ mod tests {
     use crate::tests::helpers::{get_api_key, setup_db};
     // ... other imports
 
-    // 테스트 함수들
+    // Test functions
 }
 ```
 
-### 공유 헬퍼 함수
+### Shared Helpers
 
-`tests/mod.rs`에 공유 헬퍼를 정의합니다:
+Define shared helpers in `tests/mod.rs`:
 
 ```rust
 #[cfg(test)]
@@ -419,7 +563,7 @@ pub mod helpers {
             .await
             .unwrap();
 
-        // 테이블 생성
+        // Create tables
         sqlx::query("CREATE TABLE ...")
             .execute(&pool)
             .await
@@ -434,10 +578,10 @@ pub mod helpers {
 }
 ```
 
-### 테스트 함수 네이밍
+### Test Function Naming
 
 ```rust
-// ✅ Good: test_ 접두사 + 테스트 대상 + 예상 결과
+// ✅ Good: test_ prefix + target + expected result
 #[tokio::test]
 async fn test_save_returns_id() { }
 
@@ -447,7 +591,7 @@ async fn test_sent_count_empty() { }
 #[tokio::test]
 async fn test_stop_topic_updates_created_only() { }
 
-// ❌ Bad: 불명확하거나 너무 긴 이름
+// ❌ Bad: Unclear or too long names
 #[tokio::test]
 async fn test1() { }
 
@@ -455,10 +599,10 @@ async fn test1() { }
 async fn test_that_when_we_save_an_email_request_it_should_return_the_id() { }
 ```
 
-### 테스트 헬퍼 함수
+### Test Helper Functions
 
 ```rust
-// ✅ Good: 반복되는 테스트 데이터 생성 함수
+// ✅ Good: Factory function for test data
 fn create_test_request() -> EmailRequest {
     EmailRequest {
         id: None,
@@ -474,7 +618,7 @@ fn create_test_request() -> EmailRequest {
 }
 ```
 
-### API 테스트 패턴
+### API Test Pattern
 
 ```rust
 #[tokio::test]
@@ -513,7 +657,7 @@ async fn test_create_message_success() {
 }
 ```
 
-### 데이터베이스 테스트 패턴
+### Database Test Pattern
 
 ```rust
 #[tokio::test]
@@ -547,69 +691,145 @@ async fn test_save_batch_multiple() {
 }
 ```
 
-### Assertion 스타일
+### Assertion Style
 
 ```rust
-// ✅ Good: 명확한 assertion
+// ✅ Good: Clear assertions
 assert_eq!(response.status(), StatusCode::OK);
 assert_eq!(saved.id, Some(1));
 assert!(counts.is_empty());
 
-// ✅ Good: 실패 시 유용한 메시지
+// ✅ Good: Helpful message on failure
 assert_eq!(counts.get("Created"), Some(&2), "Created count mismatch");
 
-// ❌ Bad: 불명확한 assertion
+// ❌ Bad: Unclear assertion
 assert!(response.status() == StatusCode::OK);
 ```
 
-### 테스트 분류
+### Test Categories
 
 ```
 tests/
-├── mod.rs              # 공유 헬퍼
-├── auth_tests.rs       # 인증 관련 테스트
-├── event_tests.rs      # 이벤트 핸들러 테스트
-├── handler_tests.rs    # 메시지/토픽 핸들러 테스트
-├── request_tests.rs    # EmailRequest 모델 테스트
-└── status_tests.rs     # EmailMessageStatus 열거형 테스트
+├── mod.rs              # Shared helpers
+├── auth_tests.rs       # Authentication tests
+├── event_tests.rs      # Event handler tests
+├── handler_tests.rs    # Message/topic handler tests
+├── request_tests.rs    # EmailRequest model tests
+└── status_tests.rs     # EmailMessageStatus enum tests
 ```
 
-### 테스트 격리
+### Test Isolation
 
 ```rust
-// ✅ Good: 각 테스트는 독립적인 인메모리 DB 사용
+// ✅ Good: Each test uses independent in-memory DB
 #[tokio::test]
 async fn test_independent_1() {
-    let db = setup_db().await;  // 새로운 인메모리 DB
+    let db = setup_db().await;  // Fresh in-memory DB
     // ...
 }
 
 #[tokio::test]
 async fn test_independent_2() {
-    let db = setup_db().await;  // 별도의 인메모리 DB
+    let db = setup_db().await;  // Separate in-memory DB
     // ...
 }
 ```
 
----
+### Test Coverage Guidelines
 
-## 🚨 알려진 제한사항
-
-1. **요청당 이메일 수**: 최대 10,000개
-2. **Rate Limiting**: `MAX_SEND_PER_SECOND` 환경변수로 제어
-3. **DB 크기**: SQLite 단일 파일
-4. **동시성**: 스케줄러 단일 인스턴스
+1. **Model tests**: All public methods, edge cases, error conditions
+2. **Handler tests**: Success paths, validation errors, auth failures
+3. **Status enum tests**: All variants, conversion functions
+4. **Integration tests**: Full request/response cycles
 
 ---
 
-## 🤝 기여 가이드라인
+## 🔄 Common Modification Patterns
 
-1. **브랜치 네이밍**: `feature/기능명`, `fix/버그명`
-2. **커밋 메시지**: `[모듈명] 변경 내용 요약`
-3. **테스트 통과**: `cargo test` 전체 통과
-4. **Clippy 통과**: `cargo clippy` 경고 없음
-5. **코드 포맷팅**: `cargo fmt` 적용
+### Adding a New API Endpoint
+
+1. Create handler function in `src/handlers/`
+2. Add route in `src/app.rs`
+3. Add authentication if needed (check `middlewares/auth_middlewares.rs`)
+4. Write tests in `src/tests/`
+
+### Adding a New Database Column
+
+1. Update `init_database.sh` schema
+2. Update model in `src/models/`
+3. Update test helper `setup_db()` in `src/tests/mod.rs`
+4. Update relevant queries
+
+### Modifying Rate Limiting
+
+1. Edit constants in `src/services/receiver.rs`
+2. Or change `MAX_SEND_PER_SECOND` environment variable
+
+### Adding a New Background Task
+
+1. Create task function in `src/services/`
+2. Create channel if needed in `main.rs`
+3. Spawn task with `tokio::spawn` in `main.rs`
 
 ---
 
-*최종 업데이트: 2025-12-27*
+## 🚨 Known Limitations
+
+1. **Emails per request**: Maximum 10,000
+2. **Rate Limiting**: Controlled by `MAX_SEND_PER_SECOND` env var
+3. **Database**: SQLite single file (not suitable for horizontal scaling)
+4. **Scheduler**: Single instance (no distributed locking)
+5. **Timezone**: `scheduled_at` is parsed as local time, stored as UTC
+
+---
+
+## 🤝 Contribution Guidelines
+
+1. **Branch naming**: `feature/feature-name`, `fix/bug-name`
+2. **Commit messages**: `[module] Summary of changes`
+3. **Tests**: All `cargo test` must pass
+4. **Clippy**: No warnings with `cargo clippy`
+5. **Formatting**: Apply `cargo fmt` before commit
+
+### Pre-commit Checklist
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+```
+
+---
+
+## 📚 Quick Reference
+
+### Status Flow
+
+```
+Created (0) ──┬──▶ Processed (1) ──▶ Sent (2)
+              │                  └──▶ Failed (3)
+              └──▶ Stopped (4)
+```
+
+### Channel Flow
+
+```
+API Handler ──▶ tx_send ──▶ Sender ──▶ tx_post_send ──▶ Post-Processor
+     │              ▲
+     │              │
+     └── Scheduler ─┘
+```
+
+### Key Files for Common Tasks
+
+| Task | Primary Files |
+|------|---------------|
+| Add endpoint | `handlers/*.rs`, `app.rs` |
+| Modify sending | `services/receiver.rs`, `services/sender.rs` |
+| Change schema | `init_database.sh`, `models/*.rs`, `tests/mod.rs` |
+| Update config | `config.rs`, `.env` |
+| Add tests | `tests/*.rs` |
+
+---
+
+*Last updated: 2025-12-27*
