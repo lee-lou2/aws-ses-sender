@@ -2,6 +2,7 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -144,13 +145,43 @@ pub async fn create_message(
         };
 
     if !is_scheduled {
-        for mut req in saved_requests {
-            if let Err(e) = state.tx.send(req.clone()).await {
-                error!("Failed to send to channel: {e}");
+        let mut failed_requests = Vec::new();
+        let mut channel_closed = false;
+
+        for req in saved_requests {
+            if channel_closed {
+                // Channel already closed, add remaining to failed
+                let mut req = req;
                 req.status = EmailMessageStatus::Created as i32;
-                if let Err(e) = req.update(&state.db_pool).await {
-                    error!("Failed to rollback status for id={:?}: {e}", req.id);
+                failed_requests.push(req);
+                continue;
+            }
+
+            // try_send for non-blocking channel send when buffer is available
+            match state.tx.try_send(req) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(req)) => {
+                    // Channel full: fall back to blocking send
+                    if state.tx.send(req).await.is_err() {
+                        error!("Channel closed while sending");
+                        channel_closed = true;
+                    }
                 }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(mut req)) => {
+                    error!("Channel closed");
+                    req.status = EmailMessageStatus::Created as i32;
+                    failed_requests.push(req);
+                    channel_closed = true;
+                }
+            }
+        }
+
+        // Batch rollback for failed requests
+        if !failed_requests.is_empty() {
+            warn!("Rolling back {} failed requests", failed_requests.len());
+            let ids: Vec<i32> = failed_requests.iter().filter_map(|r| r.id).collect();
+            if let Err(e) = rollback_to_created(&state.db_pool, &ids).await {
+                error!("Failed to rollback {} requests: {e}", ids.len());
             }
         }
     }
@@ -169,4 +200,23 @@ pub async fn create_message(
         }),
     )
         .into_response()
+}
+
+/// Batch rollback requests to Created status when channel send fails.
+async fn rollback_to_created(db_pool: &SqlitePool, ids: &[i32]) -> Result<(), sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "UPDATE email_requests SET status=?, updated_at=datetime('now') WHERE id IN ({placeholders})"
+    );
+
+    let mut query = sqlx::query(&sql).bind(EmailMessageStatus::Created as i32);
+    for id in ids {
+        query = query.bind(id);
+    }
+    query.execute(db_pool).await?;
+    Ok(())
 }

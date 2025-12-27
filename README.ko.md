@@ -46,9 +46,10 @@ Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제�
 ## ⚡ 성능 최적화
 
 ### Rate Limiting (Token Bucket + Semaphore)
-- **Token Bucket**: Atomic CAS 기반 정밀한 초당 속도 제어
+- **Token Bucket**: `Notify` 기반 이벤트 드리븐 방식 (폴링 없음)
 - **Semaphore**: 동시 네트워크 요청 제한 (rate limit의 2배)
 - **부드러운 리필**: 100ms마다 10%씩 균등 분배
+- **논블로킹 채널 전송**: `try_send()`로 즉시 전송
 
 ### 데이터베이스 (SQLite + WAL)
 - **WAL 모드**: 쓰기 중에도 동시 읽기 가능
@@ -56,7 +57,8 @@ Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제�
 - **캐시**: 64MB 인메모리 캐시 + temp_store 메모리 사용
 - **자동 vacuum**: Incremental vacuum으로 저장소 최적화
 - **배치 INSERT**: 멀티-로우 INSERT로 **10배 이상** 성능 향상
-- **배치 업데이트**: 상태별 bulk update
+- **배치 업데이트**: `CASE WHEN` 문법으로 벌크 업데이트
+- **2단계 스케줄러**: UPDATE...RETURNING + JOIN으로 효율적 폴링
 - **복합 인덱스**: 스케줄러, 카운트, stop 쿼리 최적화
 - **콘텐츠 중복 방지**: Subject/content를 별도 테이블에 저장하여 중복 방지
 

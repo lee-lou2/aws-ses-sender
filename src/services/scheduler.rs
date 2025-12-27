@@ -56,6 +56,19 @@ enum SchedulerError {
     ChannelClosed,
 }
 
+/// Row returned from UPDATE...RETURNING (without content fields).
+#[derive(sqlx::FromRow)]
+struct UpdatedRow {
+    id: i64,
+    #[allow(dead_code)]
+    topic_id: String,
+    #[allow(dead_code)]
+    content_id: i32,
+    #[allow(dead_code)]
+    email: String,
+}
+
+/// Row with content joined from `email_contents`.
 #[derive(sqlx::FromRow)]
 struct ScheduledEmailRow {
     id: i64,
@@ -68,13 +81,15 @@ struct ScheduledEmailRow {
 
 /// Atomically claims and processes a batch of scheduled emails.
 ///
-/// Uses UPDATE ... RETURNING to prevent race conditions when multiple
-/// scheduler instances run concurrently.
+/// Uses two-phase approach to avoid per-row subqueries in RETURNING:
+/// 1. UPDATE...RETURNING to atomically claim emails and get basic info
+/// 2. Single JOIN query to fetch content for all claimed emails
 async fn fetch_and_process_batch(
     tx: &mpsc::Sender<EmailRequest>,
     db_pool: &SqlitePool,
 ) -> Result<usize, SchedulerError> {
-    let rows: Vec<ScheduledEmailRow> = sqlx::query_as(
+    // Phase 1: Atomically update and return basic info (no subqueries)
+    let updated: Vec<UpdatedRow> = sqlx::query_as(
         "UPDATE email_requests
          SET status = ?, updated_at = datetime('now')
          WHERE id IN (
@@ -83,9 +98,7 @@ async fn fetch_and_process_batch(
              ORDER BY scheduled_at ASC
              LIMIT ?
          )
-         RETURNING id, topic_id, content_id, email,
-                   (SELECT subject FROM email_contents WHERE id = content_id) as subject,
-                   (SELECT content FROM email_contents WHERE id = content_id) as content",
+         RETURNING id, topic_id, content_id, email",
     )
     .bind(EmailMessageStatus::Processed as i32)
     .bind(EmailMessageStatus::Created as i32)
@@ -93,11 +106,27 @@ async fn fetch_and_process_batch(
     .fetch_all(db_pool)
     .await?;
 
-    if rows.is_empty() {
+    if updated.is_empty() {
         return Ok(0);
     }
 
-    let count = rows.len();
+    let count = updated.len();
+
+    // Phase 2: Fetch content with single JOIN query
+    let ids: Vec<i64> = updated.iter().map(|r| r.id).collect();
+    let placeholders = vec!["?"; ids.len()].join(",");
+    let sql = format!(
+        "SELECT r.id, r.topic_id, r.content_id, r.email, c.subject, c.content
+         FROM email_requests r
+         JOIN email_contents c ON r.content_id = c.id
+         WHERE r.id IN ({placeholders})"
+    );
+
+    let mut query = sqlx::query_as::<_, ScheduledEmailRow>(&sql);
+    for id in &ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(db_pool).await?;
 
     for row in rows {
         #[allow(clippy::cast_possible_truncation)]

@@ -44,8 +44,8 @@
 ```
 
 ### Data Flow
-1. **Immediate Sending**: API → Batch INSERT → Send channel → Rate-limited sending → Batch result update
-2. **Scheduled Sending**: API → Batch INSERT (Created) → Scheduler polling → Send channel → Sending → Result update
+1. **Immediate Sending**: API → Batch INSERT → `try_send()` to channel → Rate-limited sending → CASE WHEN batch update
+2. **Scheduled Sending**: API → Batch INSERT (Created) → Two-phase scheduler (UPDATE...RETURNING + JOIN) → Send channel → Sending → Result update
 
 ---
 
@@ -99,11 +99,18 @@ src/
 **Most complex module** - Handles rate limiting and concurrency control
 
 ```rust
-// Token Bucket: Controls sends per second
-let tokens = Arc::new(AtomicU64::new(max_per_sec));
+// Event-driven Token Bucket with Notify (no polling)
+struct TokenBucket {
+    tokens: AtomicU64,
+    max_per_sec: u64,
+    notify: Notify,
+}
 
 // Semaphore: Limits concurrent requests (max_per_sec * 2)
 let semaphore = Arc::new(Semaphore::new(max_per_sec * 2));
+
+// Bulk updates using CASE WHEN for message_id and error fields
+bulk_update_message_ids(&mut tx, &updates).await?;
 ```
 
 ### `src/models/request.rs`
@@ -642,4 +649,4 @@ async fn test_independent_2() {
 
 ---
 
-*Last Updated: 2025-12-27*
+*Last Updated: 2025-12-28*

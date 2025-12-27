@@ -46,9 +46,10 @@ Built with Rust and Tokio for exceptional throughput and reliability.
 ## ⚡ Performance Optimizations
 
 ### Rate Limiting (Token Bucket + Semaphore)
-- **Token Bucket**: Precise per-second rate control with atomic CAS
+- **Token Bucket**: Event-driven rate control with `Notify` (no polling)
 - **Semaphore**: Limits concurrent network requests (2x rate limit)
 - **Smooth refill**: 10% tokens every 100ms for even distribution
+- **Non-blocking channel send**: Uses `try_send()` for immediate sends
 
 ### Database (SQLite + WAL)
 - **WAL mode**: Concurrent reads during writes
@@ -56,7 +57,8 @@ Built with Rust and Tokio for exceptional throughput and reliability.
 - **Cache**: 64MB in-memory cache + temp_store in memory
 - **Auto vacuum**: Incremental vacuum for storage optimization
 - **Batch INSERT**: Multi-row INSERT provides **10x+** performance
-- **Batch updates**: Bulk status updates per transaction
+- **Batch updates**: Bulk status updates with `CASE WHEN` syntax
+- **Two-phase scheduler**: UPDATE...RETURNING + JOIN for efficient polling
 - **Composite Indexes**: Optimized for scheduler, count, and stop queries
 - **Content deduplication**: Subject/content stored separately to prevent duplication
 
