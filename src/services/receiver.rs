@@ -104,32 +104,32 @@ pub async fn receive_send_message(
 
     info!("Email sender started: {max_per_sec} emails/sec");
 
-    while let Some(mut request) = rx.recv().await {
+    while let Some(request) = rx.recv().await {
         bucket.acquire().await;
 
         let request_id = request.id.unwrap_or_default();
-        // Append tracking pixel
+        // Clone content from Arc and append tracking pixel
+        // This defers the clone to send time (vs creation time for all emails)
+        let mut content = (*request.content).clone();
         let _ = write!(
-            request.content,
+            content,
             "<img src=\"{server_url}/v1/events/open?request_id={request_id}\">"
         );
 
         let tx_clone = tx.clone();
         let from_email = Arc::clone(&from_email);
+        let subject = Arc::clone(&request.subject);
+        let email = request.email.clone();
         let Ok(permit) = semaphore.clone().acquire_owned().await else {
             break;
         };
 
+        // Move request ownership into spawned task for result handling
+        let mut request = request;
         tokio::spawn(async move {
             let _permit = permit;
 
-            match crate::services::sender::send_email(
-                &from_email,
-                &request.email,
-                &request.subject,
-                &request.content,
-            )
-            .await
+            match crate::services::sender::send_email(&from_email, &email, &subject, &content).await
             {
                 Ok(message_id) => {
                     debug!("Sent to {}: {message_id}", request.email);
@@ -241,12 +241,14 @@ async fn bulk_update_all(db_pool: &SqlitePool, batch: &[EmailRequest]) -> Result
     }
 
     // Build CASE WHEN clauses - separate binds to maintain correct order
-    let mut status_cases = String::new();
-    let mut message_id_cases = String::new();
-    let mut error_cases = String::new();
-    let mut status_binds: Vec<i32> = Vec::new();
-    let mut message_id_binds: Vec<String> = Vec::new();
-    let mut error_binds: Vec<String> = Vec::new();
+    // Pre-allocate capacity to avoid reallocations during iteration
+    let batch_len = batch.len();
+    let mut status_cases = String::with_capacity(batch_len * 20);
+    let mut message_id_cases = String::with_capacity(batch_len * 20);
+    let mut error_cases = String::with_capacity(batch_len * 20);
+    let mut status_binds: Vec<i32> = Vec::with_capacity(batch_len);
+    let mut message_id_binds: Vec<String> = Vec::with_capacity(batch_len);
+    let mut error_binds: Vec<String> = Vec::with_capacity(batch_len);
 
     for req in batch {
         let Some(id) = req.id else { continue };
@@ -661,8 +663,8 @@ mod tests {
                 topic_id: Some("test".to_string()),
                 content_id: Some(content_id as i32),
                 email: "test1@test.com".to_string(),
-                subject: String::new(),
-                content: String::new(),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
                 scheduled_at: None,
                 status: EmailMessageStatus::Sent as i32,
                 message_id: Some("msg_1".to_string()),
@@ -673,8 +675,8 @@ mod tests {
                 topic_id: Some("test".to_string()),
                 content_id: Some(content_id as i32),
                 email: "test2@test.com".to_string(),
-                subject: String::new(),
-                content: String::new(),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
                 scheduled_at: None,
                 status: EmailMessageStatus::Failed as i32,
                 message_id: None,
@@ -685,8 +687,8 @@ mod tests {
                 topic_id: Some("test".to_string()),
                 content_id: Some(content_id as i32),
                 email: "test3@test.com".to_string(),
-                subject: String::new(),
-                content: String::new(),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
                 scheduled_at: None,
                 status: EmailMessageStatus::Sent as i32,
                 message_id: Some("msg_3".to_string()),

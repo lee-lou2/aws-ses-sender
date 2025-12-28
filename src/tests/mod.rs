@@ -11,6 +11,8 @@ mod topic_tests;
 
 #[cfg(test)]
 pub mod helpers {
+    use std::sync::Arc;
+
     use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
 
     use crate::models::{
@@ -143,8 +145,8 @@ pub mod helpers {
             topic_id: Some("test_topic".to_string()),
             content_id: Some(content_id),
             email: "test@example.com".to_string(),
-            subject: String::new(),
-            content: String::new(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
             scheduled_at: None,
             status: EmailMessageStatus::Created as i32,
             error: None,

@@ -62,6 +62,11 @@ Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제�
 - **복합 인덱스**: 스케줄러, 카운트, stop 쿼리 최적화
 - **콘텐츠 중복 방지**: Subject/content를 별도 테이블에 저장하여 중복 방지
 
+### 메모리 최적화
+- **Arc<String>**: Subject/content를 `Arc`로 공유 (10,000건 발송 시 1회 할당)
+- **Vec::with_capacity()**: 배치 처리 시 미리 용량 할당으로 재할당 방지
+- **지연 복사**: 트래킹 픽셀 추가를 발송 시점에 수행 (생성 시점 대비 메모리 절약)
+
 ### 커넥션 풀링
 - **SES 클라이언트**: OnceCell로 단일 인스턴스 캐싱
 - **DB 풀**: 5-20개 연결, idle timeout 적용
@@ -207,6 +212,13 @@ RUST_LOG=warn cargo run   # 경고만
 
 ### 헬스 체크
 ```bash
+# 기본 헬스 체크 (인증 불필요)
+curl http://localhost:3000/health
+
+# DB 연결 확인 포함 (인증 불필요)
+curl http://localhost:3000/ready
+
+# 발송 건수 조회
 curl http://localhost:3000/v1/events/counts/sent \
   -H "X-API-KEY: $API_KEY"
 ```
@@ -215,21 +227,23 @@ curl http://localhost:3000/v1/events/counts/sent \
 
 ```
 src/
-├── main.rs                 # 진입점, 초기화
+├── main.rs                 # 진입점, 초기화, Graceful Shutdown
 ├── app.rs                  # 라우터 설정
 ├── config.rs               # 환경변수 관리
+├── constants.rs            # 공용 상수 (BATCH_INSERT_SIZE)
 ├── state.rs                # 애플리케이션 상태
 ├── handlers/               # HTTP 요청 핸들러
 │   ├── message_handlers.rs # 이메일 발송 API
 │   ├── event_handlers.rs   # SNS 이벤트, 오픈 트래킹
+│   ├── health_handlers.rs  # 헬스 체크 (/health, /ready)
 │   └── topic_handlers.rs   # 토픽 관리
 ├── services/               # 백그라운드 서비스
 │   ├── scheduler.rs        # 예약 이메일 조회
-│   ├── receiver.rs         # Rate-limited 발송
-│   └── sender.rs           # AWS SES API 호출
+│   ├── receiver.rs         # Rate-limited 발송, 배치 업데이트
+│   └── sender.rs           # AWS SES API 호출, 재시도 로직
 ├── models/                 # 데이터 모델
 │   ├── content.rs          # EmailContent (subject, content 저장)
-│   ├── request.rs          # EmailRequest, EmailMessageStatus
+│   ├── request.rs          # EmailRequest (Arc<String> 최적화)
 │   └── result.rs           # EmailResult
 ├── middlewares/            # HTTP 미들웨어
 │   └── auth_middlewares.rs # API Key 인증

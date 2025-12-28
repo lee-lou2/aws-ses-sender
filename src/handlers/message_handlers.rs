@@ -1,5 +1,7 @@
 //! Email message sending handler
 
+use std::sync::Arc;
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -91,6 +93,8 @@ pub async fn create_message(
     };
 
     // 2. Create requests with content_id
+    // Use Arc to share subject/content across all emails in the same message,
+    // avoiding expensive string cloning (e.g., 10,000 emails = 1 Arc::clone vs 10,000 String::clone)
     let requests: Vec<EmailRequest> = payload
         .messages
         .into_iter()
@@ -98,8 +102,9 @@ pub async fn create_message(
         .flat_map(|(msg, saved_content)| {
             let topic_id = msg.topic_id.unwrap_or_default();
             let content_id = saved_content.id;
-            let subject = saved_content.subject.clone();
-            let content = saved_content.content.clone();
+            // Create Arc once per message, share across all emails
+            let subject = Arc::new(saved_content.subject.clone());
+            let content = Arc::new(saved_content.content.clone());
             let sched = scheduled_at.clone();
 
             msg.emails.into_iter().map(move |email| EmailRequest {
@@ -107,8 +112,8 @@ pub async fn create_message(
                 topic_id: Some(topic_id.clone()),
                 content_id,
                 email,
-                subject: subject.clone(),
-                content: content.clone(),
+                subject: Arc::clone(&subject),
+                content: Arc::clone(&content),
                 scheduled_at: sched.clone(),
                 status,
                 error: None,

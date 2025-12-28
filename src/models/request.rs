@@ -1,6 +1,6 @@
 //! Email request model and database operations
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
@@ -45,22 +45,31 @@ impl EmailMessageStatus {
     }
 }
 
+/// Default value for `Arc<String>` fields in serde deserialization.
+fn default_arc_string() -> Arc<String> {
+    Arc::new(String::new())
+}
+
 /// Email request entity
 ///
 /// - `content_id`: FK to `email_contents` table (for storage efficiency)
 /// - `subject`, `content`: Loaded at runtime via JOIN (not stored in this table)
+///   These use `Arc<String>` to avoid expensive cloning when creating many requests
+///   with the same content (e.g., 10,000 emails with identical subject/body).
 #[derive(Clone, Debug, Deserialize)]
 pub struct EmailRequest {
     pub id: Option<i32>,
     pub topic_id: Option<String>,
     pub content_id: Option<i32>,
     pub email: String,
-    /// Loaded from `email_contents` at runtime (not stored in `email_requests`)
-    #[serde(default)]
-    pub subject: String,
-    /// Loaded from `email_contents` at runtime (not stored in `email_requests`)
-    #[serde(default)]
-    pub content: String,
+    /// Loaded from `email_contents` at runtime (not stored in `email_requests`).
+    /// Uses `Arc<String>` to share across multiple requests without cloning.
+    #[serde(skip, default = "default_arc_string")]
+    pub subject: Arc<String>,
+    /// Loaded from `email_contents` at runtime (not stored in `email_requests`).
+    /// Uses `Arc<String>` to share; cloned only when adding tracking pixel.
+    #[serde(skip, default = "default_arc_string")]
+    pub content: Arc<String>,
     pub scheduled_at: Option<String>,
     pub status: i32,
     pub error: Option<String>,

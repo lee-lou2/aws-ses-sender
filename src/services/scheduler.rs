@@ -1,6 +1,6 @@
 //! Scheduled email pickup service
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -135,8 +135,8 @@ async fn fetch_and_process_batch(
             topic_id: Some(row.topic_id),
             content_id: Some(row.content_id),
             email: row.email,
-            subject: row.subject,
-            content: row.content,
+            subject: Arc::new(row.subject),
+            content: Arc::new(row.content),
             scheduled_at: None,
             status: EmailMessageStatus::Processed as i32,
             error: None,

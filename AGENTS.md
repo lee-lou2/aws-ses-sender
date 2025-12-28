@@ -53,20 +53,22 @@
 
 ```
 src/
-├── main.rs                 # Entry point, initialization, background task spawning
+├── main.rs                 # Entry point, initialization, graceful shutdown
 ├── app.rs                  # Axum router setup
 ├── config.rs               # Environment variable loading (singleton)
+├── constants.rs            # Shared constants (BATCH_INSERT_SIZE)
 ├── state.rs                # AppState definition (DB pool, channels)
 ├── handlers/               # HTTP request handlers
 │   ├── mod.rs
 │   ├── message_handlers.rs # POST /v1/messages
 │   ├── event_handlers.rs   # GET/POST /v1/events/*
+│   ├── health_handlers.rs  # GET /health, /ready
 │   └── topic_handlers.rs   # GET/DELETE /v1/topics/{id}
 ├── services/               # Background services
 │   ├── mod.rs
 │   ├── scheduler.rs        # Scheduled email polling (10-second interval)
 │   ├── receiver.rs         # Rate-limited sending + batch DB updates
-│   └── sender.rs           # AWS SES API calls (singleton client)
+│   └── sender.rs           # AWS SES API calls (singleton client, retry logic)
 ├── models/                 # Data models
 │   ├── mod.rs
 │   ├── content.rs          # EmailContent (subject, content storage)
@@ -80,6 +82,7 @@ src/
     ├── auth_tests.rs
     ├── event_tests.rs
     ├── handler_tests.rs
+    ├── health_tests.rs
     ├── request_tests.rs
     ├── scheduler_tests.rs
     ├── status_tests.rs
@@ -94,6 +97,7 @@ src/
 - Application entry point
 - Logger, Sentry, DB initialization
 - Spawns 3 background tasks
+- Graceful shutdown with `tokio::signal::ctrl_c()`
 
 ### `src/services/receiver.rs`
 **Most complex module** - Handles rate limiting and concurrency control
@@ -110,11 +114,25 @@ struct TokenBucket {
 let semaphore = Arc::new(Semaphore::new(max_per_sec * 2));
 
 // Bulk updates using CASE WHEN for message_id and error fields
-bulk_update_message_ids(&mut tx, &updates).await?;
+bulk_update_all(&mut tx, &batch).await?;
+
+// Vec::with_capacity() for pre-allocation
+let mut status_binds: Vec<i32> = Vec::with_capacity(batch_len);
+
+// Deferred clone: Tracking pixel added at send time (not creation time)
+let mut content = (*request.content).clone();  // Clone only when sending
 ```
 
 ### `src/models/request.rs`
 ```rust
+// Arc<String> for subject/content: Share single allocation across all emails
+// 10,000 emails = 1 Arc::clone vs 10,000 String::clone
+pub struct EmailRequest {
+    pub subject: Arc<String>,
+    pub content: Arc<String>,
+    // ...
+}
+
 pub enum EmailMessageStatus {
     Created = 0,    // Created (waiting for scheduled send)
     Processed = 1,  // Processed (queued for sending)
@@ -167,6 +185,8 @@ pub enum EmailMessageStatus {
 
 | Method | Path | Auth | Handler Function |
 |--------|------|------|-------------|
+| GET | `/health` | ❌ | `health_check` |
+| GET | `/ready` | ❌ | `readiness_check` |
 | POST | `/v1/messages` | ✅ | `create_message` |
 | GET | `/v1/topics/{topic_id}` | ✅ | `get_topic` |
 | DELETE | `/v1/topics/{topic_id}` | ✅ | `stop_topic` |
@@ -217,7 +237,7 @@ cargo fmt
 | `DB_MAX_CONNECTIONS` | 20 | main.rs |
 | `SEND_CHANNEL_BUFFER` | 10,000 | main.rs |
 | `BATCH_SIZE` (scheduler) | 1,000 | scheduler.rs |
-| `BATCH_INSERT_SIZE` | 100 | content.rs, request.rs |
+| `BATCH_INSERT_SIZE` | 150 | constants.rs |
 | `BATCH_FLUSH_INTERVAL_MS` | 500 | receiver.rs |
 
 ---
@@ -486,15 +506,15 @@ fn create_test_content() -> EmailContent {
     }
 }
 
-// ✅ Good: Create request with content_id
+// ✅ Good: Create request with content_id (Arc<String> for memory efficiency)
 fn create_test_request_with_content_id(content_id: i32) -> EmailRequest {
     EmailRequest {
         id: None,
         topic_id: Some("test_topic".to_string()),
         content_id: Some(content_id),
         email: "test@example.com".to_string(),
-        subject: String::new(),  // Loaded via JOIN at runtime
-        content: String::new(),  // Loaded via JOIN at runtime
+        subject: Arc::new(String::new()),  // Loaded via JOIN at runtime
+        content: Arc::new(String::new()),  // Loaded via JOIN at runtime
         scheduled_at: None,
         status: EmailMessageStatus::Created as i32,
         error: None,
