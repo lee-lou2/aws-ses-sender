@@ -21,6 +21,7 @@ RUN mkdir src && \
     rm -rf src target/release/deps/aws_ses_sender*
 
 # 실제 소스 복사 및 빌드
+COPY migrations ./migrations
 COPY src ./src
 RUN cargo build --release
 
