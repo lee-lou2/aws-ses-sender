@@ -220,68 +220,95 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<EmailRequest>) {
     let count = batch.len();
     debug!("Flushing {count} results");
 
-    // Group by status for bulk updates
-    let mut sent_ids: Vec<i32> = Vec::new();
-    let mut failed_ids: Vec<i32> = Vec::new();
-    let mut message_id_updates: Vec<(i32, String)> = Vec::new();
-    let mut error_updates: Vec<(i32, String)> = Vec::new();
-
-    for req in batch.iter() {
-        let id = req.id.unwrap_or_default();
-        if req.status == EmailMessageStatus::Sent as i32 {
-            sent_ids.push(id);
-            if let Some(ref msg_id) = req.message_id {
-                message_id_updates.push((id, msg_id.clone()));
-            }
-        } else if req.status == EmailMessageStatus::Failed as i32 {
-            failed_ids.push(id);
-            if let Some(ref err) = req.error {
-                error_updates.push((id, err.clone()));
-            }
-        }
-    }
-
-    let Ok(mut tx) = db_pool.begin().await else {
-        error!("Transaction begin failed");
+    if let Err(e) = bulk_update_all(db_pool, batch).await {
+        error!("Bulk update failed: {e:?}, falling back to individual updates");
         fallback_individual_updates(db_pool, batch).await;
         return;
-    };
-
-    // Bulk update sent status
-    if !sent_ids.is_empty() {
-        if let Err(e) = bulk_update_status(&mut tx, &sent_ids, EmailMessageStatus::Sent).await {
-            error!("Bulk update sent failed: {e:?}");
-        }
-    }
-
-    // Bulk update failed status
-    if !failed_ids.is_empty() {
-        if let Err(e) = bulk_update_status(&mut tx, &failed_ids, EmailMessageStatus::Failed).await {
-            error!("Bulk update failed failed: {e:?}");
-        }
-    }
-
-    // Bulk update message_ids using CASE WHEN
-    if !message_id_updates.is_empty() {
-        if let Err(e) = bulk_update_message_ids(&mut tx, &message_id_updates).await {
-            error!("Bulk update message_ids failed: {e:?}");
-        }
-    }
-
-    // Bulk update errors using CASE WHEN
-    if !error_updates.is_empty() {
-        if let Err(e) = bulk_update_errors(&mut tx, &error_updates).await {
-            error!("Bulk update errors failed: {e:?}");
-        }
-    }
-
-    if let Err(e) = tx.commit().await {
-        error!("Transaction commit failed: {e:?}");
     }
 
     batch.clear();
 }
 
+/// Unified bulk update for status, `message_id`, and error fields.
+async fn bulk_update_all(db_pool: &SqlitePool, batch: &[EmailRequest]) -> Result<(), sqlx::Error> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<i32> = batch.iter().filter_map(|r| r.id).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    // Build CASE WHEN clauses - separate binds to maintain correct order
+    let mut status_cases = String::new();
+    let mut message_id_cases = String::new();
+    let mut error_cases = String::new();
+    let mut status_binds: Vec<i32> = Vec::new();
+    let mut message_id_binds: Vec<String> = Vec::new();
+    let mut error_binds: Vec<String> = Vec::new();
+
+    for req in batch {
+        let Some(id) = req.id else { continue };
+
+        // Status case
+        let _ = write!(status_cases, "WHEN {id} THEN ? ");
+        status_binds.push(req.status);
+
+        // Message ID case (only if present)
+        if let Some(ref msg_id) = req.message_id {
+            let _ = write!(message_id_cases, "WHEN {id} THEN ? ");
+            message_id_binds.push(msg_id.clone());
+        }
+
+        // Error case (only if present)
+        if let Some(ref err) = req.error {
+            let _ = write!(error_cases, "WHEN {id} THEN ? ");
+            error_binds.push(err.clone());
+        }
+    }
+
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+
+    // Build SQL with conditional CASE WHEN clauses
+    let message_id_sql = if message_id_cases.is_empty() {
+        String::new()
+    } else {
+        format!(", message_id = CASE id {message_id_cases}ELSE message_id END")
+    };
+
+    let error_sql = if error_cases.is_empty() {
+        String::new()
+    } else {
+        format!(", error = CASE id {error_cases}ELSE error END")
+    };
+
+    let sql = format!(
+        "UPDATE email_requests SET status = CASE id {status_cases}ELSE status END{message_id_sql}{error_sql}, updated_at = datetime('now') WHERE id IN ({placeholders})"
+    );
+
+    let mut query = sqlx::query(&sql);
+
+    // Bind values in order: status cases, message_id cases, error cases, then ids
+    for status in &status_binds {
+        query = query.bind(*status);
+    }
+    for msg_id in &message_id_binds {
+        query = query.bind(msg_id);
+    }
+    for err in &error_binds {
+        query = query.bind(err);
+    }
+    for id in &ids {
+        query = query.bind(*id);
+    }
+
+    query.execute(db_pool).await?;
+    Ok(())
+}
+
+/// Bulk update status (kept for testing individual components).
+#[allow(dead_code)]
 async fn bulk_update_status(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ids: &[i32],
@@ -304,7 +331,8 @@ async fn bulk_update_status(
     Ok(())
 }
 
-/// Bulk update `message_id` values using CASE WHEN for better performance.
+/// Bulk update `message_id` values (kept for testing individual components).
+#[allow(dead_code)]
 async fn bulk_update_message_ids(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     updates: &[(i32, String)],
@@ -331,7 +359,8 @@ async fn bulk_update_message_ids(
     Ok(())
 }
 
-/// Bulk update errors using CASE WHEN for better performance.
+/// Bulk update errors (kept for testing individual components).
+#[allow(dead_code)]
 async fn bulk_update_errors(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     updates: &[(i32, String)],
@@ -614,5 +643,99 @@ mod tests {
         bulk_update_message_ids(&mut tx, &[]).await.unwrap();
         bulk_update_errors(&mut tx, &[]).await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_all_unified() {
+        let db = setup_db().await;
+        let content_id = insert_test_content(&db).await;
+
+        insert_test_request(&db, content_id, 1).await;
+        insert_test_request(&db, content_id, 2).await;
+        insert_test_request(&db, content_id, 3).await;
+
+        // Create batch with mixed statuses
+        let batch = vec![
+            EmailRequest {
+                id: Some(1),
+                topic_id: Some("test".to_string()),
+                content_id: Some(content_id as i32),
+                email: "test1@test.com".to_string(),
+                subject: String::new(),
+                content: String::new(),
+                scheduled_at: None,
+                status: EmailMessageStatus::Sent as i32,
+                message_id: Some("msg_1".to_string()),
+                error: None,
+            },
+            EmailRequest {
+                id: Some(2),
+                topic_id: Some("test".to_string()),
+                content_id: Some(content_id as i32),
+                email: "test2@test.com".to_string(),
+                subject: String::new(),
+                content: String::new(),
+                scheduled_at: None,
+                status: EmailMessageStatus::Failed as i32,
+                message_id: None,
+                error: Some("Rate limit".to_string()),
+            },
+            EmailRequest {
+                id: Some(3),
+                topic_id: Some("test".to_string()),
+                content_id: Some(content_id as i32),
+                email: "test3@test.com".to_string(),
+                subject: String::new(),
+                content: String::new(),
+                scheduled_at: None,
+                status: EmailMessageStatus::Sent as i32,
+                message_id: Some("msg_3".to_string()),
+                error: None,
+            },
+        ];
+
+        bulk_update_all(&db, &batch).await.unwrap();
+
+        // Verify results using Row to handle SQLite type variations
+        use sqlx::Row;
+        let rows =
+            sqlx::query("SELECT id, status, message_id, error FROM email_requests ORDER BY id")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+
+        // ID 1: Sent with message_id
+        let status1: i32 = rows[0].get("status");
+        assert_eq!(status1, EmailMessageStatus::Sent as i32);
+        assert_eq!(
+            rows[0].get::<Option<String>, _>("message_id"),
+            Some("msg_1".to_string())
+        );
+        assert_eq!(rows[0].get::<Option<String>, _>("error"), None);
+
+        // ID 2: Failed with error
+        let status2: i32 = rows[1].get("status");
+        assert_eq!(status2, EmailMessageStatus::Failed as i32);
+        assert_eq!(rows[1].get::<Option<String>, _>("message_id"), None);
+        assert_eq!(
+            rows[1].get::<Option<String>, _>("error"),
+            Some("Rate limit".to_string())
+        );
+
+        // ID 3: Sent with message_id
+        let status3: i32 = rows[2].get("status");
+        assert_eq!(status3, EmailMessageStatus::Sent as i32);
+        assert_eq!(
+            rows[2].get::<Option<String>, _>("message_id"),
+            Some("msg_3".to_string())
+        );
+        assert_eq!(rows[2].get::<Option<String>, _>("error"), None);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_all_empty_batch() {
+        let db = setup_db().await;
+        let result = bulk_update_all(&db, &[]).await;
+        assert!(result.is_ok());
     }
 }

@@ -14,6 +14,10 @@ pub fn app(state: state::AppState) -> Router {
     let auth = from_fn(middlewares::auth_middlewares::api_key_auth);
 
     Router::new()
+        // Health check endpoints (no auth required)
+        .route("/health", get(handlers::health_handlers::health))
+        .route("/ready", get(handlers::health_handlers::ready))
+        // API endpoints
         .route(
             "/v1/messages",
             post(handlers::message_handlers::create_message).layer(auth.clone()),

@@ -2,6 +2,7 @@
 
 mod app;
 mod config;
+mod constants;
 mod handlers;
 mod middlewares;
 mod models;
@@ -11,6 +12,7 @@ mod tests;
 
 use std::env;
 
+use tokio::signal;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -54,8 +56,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         envs.max_send_per_second
     );
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("Server shutdown complete");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => info!("Received Ctrl+C, initiating graceful shutdown..."),
+        () = terminate => info!("Received SIGTERM, initiating graceful shutdown..."),
+    }
 }
 
 fn init_logger() {

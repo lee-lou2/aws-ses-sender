@@ -3,6 +3,7 @@
 mod auth_tests;
 mod event_tests;
 mod handler_tests;
+mod health_tests;
 mod request_tests;
 mod scheduler_tests;
 mod status_tests;

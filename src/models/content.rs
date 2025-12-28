@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::debug;
 
-/// Max records per batch INSERT (`SQLite` variable limit: 999)
-const BATCH_INSERT_SIZE: usize = 100;
+use crate::constants::BATCH_INSERT_SIZE;
 
 /// Email content entity (subject + body)
 #[derive(Clone, Debug, Deserialize, Serialize)]
