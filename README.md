@@ -1,130 +1,346 @@
-# 📧 AWS SES 이메일 발송기
+# AWS SES Email Sender
 
 [한국어](README.md) | [English](README.en.md)
 
 AWS SES와 SNS를 활용한 고성능 대량 이메일 발송 및 모니터링 서버입니다.
 Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제공합니다.
 
-## 🏗 시스템 아키텍처
+## 주요 기능
 
-### 기술 스택
-- 🦀 **Backend**: Rust + Axum
-- 📨 **Email Service**: AWS SES v2
-- 🔔 **Notification**: AWS SNS
-- 🔄 **Async Runtime**: Tokio
-- 💾 **Database**: SQLite (WAL mode)
-- 🔒 **인증**: X-API-KEY 헤더
-- 📊 **모니터링**: Sentry + tracing
+| 기능 | 설명 |
+|------|------|
+| 대량 발송 | 요청당 최대 10,000건 |
+| 예약 발송 | `scheduled_at` 파라미터로 지정 |
+| 실시간 모니터링 | AWS SNS를 통한 발송 결과 수신 |
+| 오픈 트래킹 | 1x1 투명 픽셀로 열람 추적 |
+| 발송 취소 | 토픽별 대기 중인 이메일 취소 |
+| 토픽 통계 | 상태별 발송 현황 조회 |
 
-### 동작 방식
+## 기술 스택
 
+| 구성 요소 | 기술 |
+|----------|------|
+| Backend | Rust + Axum |
+| Email Service | AWS SES v2 |
+| Notification | AWS SNS |
+| Async Runtime | Tokio |
+| Database | SQLite (WAL mode) |
+| 인증 | X-API-KEY 헤더 |
+| 모니터링 | Sentry + tracing |
+
+---
+
+## 시스템 아키텍처
+
+### 전체 시스템 흐름
+
+```mermaid
+flowchart TB
+    subgraph Client["클라이언트"]
+        API[API 요청]
+    end
+
+    subgraph Server["이메일 발송 서버"]
+        Handler[Message Handler]
+        Scheduler[Scheduler]
+        Sender[Sender Service]
+        Receiver[Receiver Service]
+    end
+
+    subgraph Database["데이터베이스"]
+        SQLite[(SQLite WAL)]
+    end
+
+    subgraph AWS["AWS Cloud"]
+        SES[AWS SES v2]
+        SNS[AWS SNS]
+    end
+
+    API -->|POST /v1/messages| Handler
+    Handler -->|배치 INSERT| SQLite
+    Handler -->|즉시 발송| Sender
+
+    Scheduler -->|10초마다 폴링| SQLite
+    Scheduler -->|예약 메일 픽업| Sender
+
+    Sender -->|Rate Limited| SES
+    SES -->|발송 이벤트| SNS
+    SNS -->|Webhook| Receiver
+    Receiver -->|상태 업데이트| SQLite
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  API Server │────▶│  Scheduler  │────▶│   Sender    │────▶│  AWS SES    │
-│   (Axum)    │     │  (Batch)    │     │ (Rate Limit)│     │             │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
-       │                   │                   │                   │
-       │                   ▼                   ▼                   ▼
-       │            ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-       └───────────▶│   SQLite    │◀────│ Post-Proc   │◀────│   AWS SNS   │
-                    │   (WAL)     │     │  (Batch)    │     │  (Events)   │
-                    └─────────────┘     └─────────────┘     └─────────────┘
+
+### 이메일 발송 프로세스
+
+```mermaid
+flowchart LR
+    subgraph Input["요청 수신"]
+        A[API 요청] --> B{scheduled_at?}
+    end
+
+    subgraph Immediate["즉시 발송"]
+        B -->|No| C[DB 저장]
+        C --> D[Channel 전송]
+        D --> E[Rate Limiter]
+    end
+
+    subgraph Scheduled["예약 발송"]
+        B -->|Yes| F[Created 상태 저장]
+        F --> G[Scheduler 폴링]
+        G -->|10초마다| H[UPDATE...RETURNING]
+        H --> E
+    end
+
+    subgraph Sending["발송 처리"]
+        E --> I[Token 획득]
+        I --> J[AWS SES 호출]
+        J --> K[결과 업데이트]
+    end
+
+    subgraph Result["결과 수신"]
+        L[AWS SNS] -->|Webhook| M[Receiver]
+        M --> N[배치 UPDATE]
+    end
+
+    J -.-> L
 ```
 
-#### 즉시 발송
-1. API 요청 수신 (`/v1/messages`)
-2. **배치 INSERT**로 DB 저장 → 발송 채널로 전달
-3. Token Bucket + Semaphore 기반 Rate Limiting
-4. 결과 배치 업데이트 (트랜잭션당 100건)
+### 즉시 발송 시퀀스
 
-#### 예약 발송
-1. API 요청 수신 (`scheduled_at` 포함)
-2. `Created` 상태로 저장
-3. 스케줄러가 10초마다 폴링, 원자적으로 메일 픽업 (UPDATE...RETURNING)
-4. 즉시 발송과 동일한 흐름으로 처리
+클라이언트가 `scheduled_at` 없이 요청하면 즉시 발송됩니다.
 
-## ⚡ 성능 최적화
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as Handler
+    participant DB as SQLite
+    participant S as Sender
+    participant SES as AWS SES
 
-### Rate Limiting (Token Bucket + Semaphore)
-- **Token Bucket**: `Notify` 기반 이벤트 드리븐 방식 (폴링 없음)
-- **Semaphore**: 동시 네트워크 요청 제한 (rate limit의 2배)
-- **부드러운 리필**: 100ms마다 10%씩 균등 분배
-- **논블로킹 채널 전송**: `try_send()`로 즉시 전송
+    C->>H: POST /v1/messages
+    H->>DB: Content 저장 (중복 방지)
+    H->>DB: 배치 INSERT (150건씩)
+    H->>S: Channel로 전송
+    H-->>C: 응답 반환
 
-### 데이터베이스 (SQLite + WAL)
-- **WAL 모드**: 쓰기 중에도 동시 읽기 가능
-- **mmap**: 256MB 메모리 맵 I/O
-- **캐시**: 64MB 인메모리 캐시 + temp_store 메모리 사용
-- **자동 vacuum**: Incremental vacuum으로 저장소 최적화
-- **배치 INSERT**: 멀티-로우 INSERT로 **10배 이상** 성능 향상
-- **배치 업데이트**: `CASE WHEN` 문법으로 벌크 업데이트
-- **2단계 스케줄러**: UPDATE...RETURNING + JOIN으로 효율적 폴링
-- **복합 인덱스**: 스케줄러, 카운트, stop 쿼리 최적화
-- **콘텐츠 중복 방지**: Subject/content를 별도 테이블에 저장하여 중복 방지
+    loop Rate Limited (Token Bucket)
+        S->>S: 토큰 획득 대기
+        S->>SES: 이메일 발송
+        SES-->>S: Message ID 반환
+        S->>DB: 배치 UPDATE (100건씩)
+    end
+```
+
+### 예약 발송 시퀀스
+
+`scheduled_at`이 포함된 요청은 지정 시간까지 대기 후 발송됩니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant H as Handler
+    participant DB as SQLite
+    participant Sch as Scheduler
+    participant S as Sender
+    participant SES as AWS SES
+
+    C->>H: POST /v1/messages<br/>(scheduled_at 포함)
+    H->>DB: Content 저장
+    H->>DB: Created 상태로 저장
+    H-->>C: 응답 반환 (scheduled: true)
+
+    loop 10초마다 폴링
+        Sch->>DB: UPDATE...RETURNING<br/>(원자적 픽업)
+        DB-->>Sch: 발송 대상 메일
+        Sch->>S: Channel로 전송
+    end
+
+    loop Rate Limited
+        S->>SES: 이메일 발송
+        SES-->>S: Message ID 반환
+        S->>DB: 상태 업데이트
+    end
+```
+
+### SNS 이벤트 처리
+
+AWS SES에서 발송 결과를 SNS를 통해 수신합니다.
+
+```mermaid
+flowchart LR
+    subgraph AWS["AWS Cloud"]
+        SES[AWS SES]
+        SNS[AWS SNS]
+    end
+
+    subgraph Events["이벤트 타입"]
+        D[Delivery<br/>발송 성공]
+        B[Bounce<br/>반송]
+        C[Complaint<br/>스팸 신고]
+    end
+
+    subgraph Server["이메일 서버"]
+        R[Receiver Service]
+        DB[(SQLite)]
+    end
+
+    SES -->|발송 이벤트| SNS
+    SNS --> D & B & C
+    D & B & C -->|POST /v1/events/results| R
+    R -->|배치 UPDATE| DB
+```
+
+### Rate Limiting 구조
+
+Token Bucket과 Semaphore를 조합한 이벤트 드리븐 방식입니다.
+
+```mermaid
+flowchart TB
+    subgraph TokenBucket["Token Bucket"]
+        T[토큰 풀]
+        R[100ms마다<br/>10% 리필]
+    end
+
+    subgraph Semaphore["Semaphore"]
+        S[동시 요청 제한]
+        N["Rate Limit × 2"]
+    end
+
+    subgraph Sender["발송 프로세스"]
+        A[1. 토큰 획득]
+        B[2. Semaphore 획득]
+        C[3. SES API 호출]
+        D[4. 리소스 해제]
+    end
+
+    R -.->|Notify| T
+    T --> A
+    A --> B
+    S --> B
+    B --> C
+    C --> D
+    D -.->|토큰 반환| T
+    D -.->|Permit 반환| S
+```
+
+### 데이터베이스 스키마
+
+```mermaid
+erDiagram
+    EMAIL_CONTENT {
+        string id PK
+        string subject
+        string content
+        datetime created_at
+    }
+
+    EMAIL_REQUEST {
+        string id PK
+        string topic_id
+        string email
+        string content_id FK
+        string status
+        string message_id
+        datetime scheduled_at
+        datetime created_at
+    }
+
+    EMAIL_RESULT {
+        string id PK
+        string request_id FK
+        string result_type
+        string bounce_type
+        datetime created_at
+    }
+
+    EMAIL_CONTENT ||--o{ EMAIL_REQUEST : "has"
+    EMAIL_REQUEST ||--o| EMAIL_RESULT : "has"
+```
+
+---
+
+## 성능 최적화
+
+### Rate Limiting
+
+| 구성 요소 | 방식 | 특징 |
+|----------|------|------|
+| Token Bucket | `Notify` 기반 | 폴링 없는 이벤트 드리븐 |
+| Semaphore | 동시 요청 제한 | Rate Limit의 2배 |
+| 리필 | 100ms마다 10% | 균등 분배 |
+
+### 데이터베이스
+
+| 최적화 | 효과 |
+|--------|------|
+| WAL 모드 | 쓰기 중 동시 읽기 가능 |
+| mmap 256MB | 메모리 맵 I/O |
+| 캐시 64MB | 인메모리 캐시 |
+| 배치 INSERT | 10배 이상 성능 향상 |
+| CASE WHEN UPDATE | 벌크 업데이트 |
+| UPDATE...RETURNING | 원자적 스케줄러 픽업 |
+| 복합 인덱스 | 쿼리 최적화 |
 
 ### 메모리 최적화
-- **Arc<String>**: Subject/content를 `Arc`로 공유 (10,000건 발송 시 1회 할당)
-- **Vec::with_capacity()**: 배치 처리 시 미리 용량 할당으로 재할당 방지
-- **지연 복사**: 트래킹 픽셀 추가를 발송 시점에 수행 (생성 시점 대비 메모리 절약)
 
-### 커넥션 풀링
-- **SES 클라이언트**: OnceCell로 단일 인스턴스 캐싱
-- **DB 풀**: 5-20개 연결, idle timeout 적용
-- **채널**: 발송 10,000개, 후처리 1,000개 버퍼
+| 기법 | 효과 |
+|------|------|
+| `Arc<String>` | Subject/content 공유 (10,000건 발송 시 1회 할당) |
+| `Vec::with_capacity()` | 재할당 방지 |
+| 지연 복사 | 트래킹 픽셀을 발송 시점에 추가 |
 
-## ✨ 주요 기능
+### 커넥션 관리
 
-- 🚀 대량 이메일 발송 (요청당 최대 10,000건) 및 예약 발송
-- 📊 AWS SNS를 통한 실시간 발송 결과 모니터링
-- 👀 이메일 열람 추적 (1x1 투명 픽셀)
-- ⏸ 토픽별 대기 중인 이메일 발송 취소
-- 📈 토픽별 통계
+| 리소스 | 설정 |
+|--------|------|
+| SES 클라이언트 | OnceCell 싱글톤 |
+| DB 풀 | 5-20개 연결 |
+| 발송 채널 | 10,000개 버퍼 |
+| 후처리 채널 | 1,000개 버퍼 |
 
-![프로세스 다이어그램](docs/process_diagram_ko.png)
+---
 
-## 🔧 설정 가이드
+## 설정 가이드
 
-### AWS SES 설정하기
+### AWS SES 설정
 
-#### 1️⃣ 샌드박스 모드 해제 (프로덕션 환경)
-- [AWS Support Center에서 샌드박스 해제 요청](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
+1. **샌드박스 해제** (프로덕션)
+   - [AWS Support Center에서 요청](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
 
-#### 2️⃣ 도메인 인증
-- AWS SES 콘솔에서 도메인 등록
-- DNS에 DKIM, SPF 레코드 추가
+2. **도메인 인증**
+   - AWS SES 콘솔에서 도메인 등록
+   - DNS에 DKIM, SPF 레코드 추가
 
-#### 3️⃣ 이메일 주소 인증 (샌드박스 모드)
-- AWS SES 콘솔에서 발신자 이메일 등록
+3. **이메일 인증** (샌드박스)
+   - 발신자 이메일 등록
 
-### AWS SNS 설정하기 (선택사항)
+### AWS SNS 설정 (선택)
 
-#### 1️⃣ SNS 주제 생성
-- AWS SNS 콘솔에서 새 주제 생성
+1. SNS 주제 생성
+2. SES 이벤트 대상 추가 (Bounce, Complaint, Delivery)
+3. HTTP 구독 설정 (`/v1/events/results`)
 
-#### 2️⃣ SES 이벤트 설정
-- SNS 이벤트 대상 추가 (Bounce, Complaint, Delivery)
+---
 
-#### 3️⃣ SNS 구독 설정
-- 구독 추가 (HTTP/HTTPS 엔드포인트: `/v1/events/results`)
-
-![AWS 다이어그램](docs/aws_diagram.png)
-
-## ⚙️ 환경 변수
+## 환경 변수
 
 | 변수 | 필수 | 기본값 | 설명 |
-|------|------|--------|------|
-| `SERVER_PORT` | ❌ | 8080 | 서버 포트 |
-| `SERVER_URL` | ✅ | - | 외부 접근 URL |
-| `API_KEY` | ✅ | - | API 인증 키 |
-| `AWS_REGION` | ❌ | ap-northeast-2 | AWS 리전 |
-| `AWS_ACCESS_KEY_ID` | ✅ | - | AWS 액세스 키 |
-| `AWS_SECRET_ACCESS_KEY` | ✅ | - | AWS 시크릿 키 |
-| `AWS_SES_FROM_EMAIL` | ✅ | - | 인증된 발신자 이메일 |
-| `MAX_SEND_PER_SECOND` | ❌ | 24 | 초당 최대 발송량 |
-| `SENTRY_DSN` | ❌ | - | Sentry DSN (에러 트래킹) |
-| `RUST_LOG` | ❌ | info | 로그 레벨 |
+|------|:----:|--------|------|
+| `SERVER_PORT` | | 8080 | 서버 포트 |
+| `SERVER_URL` | O | | 외부 접근 URL |
+| `API_KEY` | O | | API 인증 키 |
+| `AWS_REGION` | | ap-northeast-2 | AWS 리전 |
+| `AWS_ACCESS_KEY_ID` | O | | AWS 액세스 키 |
+| `AWS_SECRET_ACCESS_KEY` | O | | AWS 시크릿 키 |
+| `AWS_SES_FROM_EMAIL` | O | | 발신자 이메일 |
+| `MAX_SEND_PER_SECOND` | | 24 | 초당 최대 발송량 |
+| `SENTRY_DSN` | | | Sentry DSN |
+| `RUST_LOG` | | info | 로그 레벨 |
 
-## 🚀 빠른 시작
+---
+
+## 빠른 시작
 
 ```bash
 # 데이터베이스 초기화
@@ -133,18 +349,20 @@ Rust와 Tokio를 기반으로 구축되어 높은 처리량과 안정성을 제�
 # 서버 실행
 cargo run --release
 
-# Docker로 실행
+# Docker
 docker build -t ses-sender .
 docker run -p 3000:3000 --env-file .env ses-sender
 ```
 
-## 📡 API 가이드
+---
+
+## API 레퍼런스
 
 ### 이메일 발송
 
 ```http
 POST /v1/messages
-X-API-KEY: {your_api_key}
+X-API-KEY: {api_key}
 Content-Type: application/json
 ```
 
@@ -173,145 +391,113 @@ Content-Type: application/json
 }
 ```
 
-### 이벤트 추적
+### 이벤트 API
 
 | 엔드포인트 | 메서드 | 설명 |
-|----------|--------|-------------|
-| `/v1/events/open?request_id={id}` | GET | 이메일 열람 추적 (1x1 PNG 반환) |
-| `/v1/events/counts/sent?hours=24` | GET | 발송 건수 조회 (최근 N시간) |
-| `/v1/events/results` | POST | AWS SNS 이벤트 수신 |
+|----------|:------:|------|
+| `/v1/events/open?request_id={id}` | GET | 오픈 트래킹 (1x1 PNG) |
+| `/v1/events/counts/sent?hours=24` | GET | 발송 건수 조회 |
+| `/v1/events/results` | POST | SNS 이벤트 수신 |
 
-### 토픽 관리
+### 토픽 API
 
 | 엔드포인트 | 메서드 | 설명 |
-|----------|--------|-------------|
-| `/v1/topics/{topic_id}` | GET | 토픽별 통계 조회 |
-| `/v1/topics/{topic_id}` | DELETE | 대기 중인 이메일 발송 취소 |
+|----------|:------:|------|
+| `/v1/topics/{topic_id}` | GET | 통계 조회 |
+| `/v1/topics/{topic_id}` | DELETE | 발송 취소 |
 
-## 🧪 테스트
+### 헬스 체크
 
-```bash
-# 전체 테스트 실행
-cargo test
+| 엔드포인트 | 설명 | 인증 |
+|----------|------|:----:|
+| `/health` | 기본 헬스 체크 | |
+| `/ready` | DB 연결 확인 | |
 
-# 출력과 함께 실행
-cargo test -- --nocapture
+---
 
-# 특정 테스트 실행
-cargo test test_save_batch
+## 프로젝트 구조
+
+```
+src/
+├── main.rs                 # 진입점, Graceful Shutdown
+├── app.rs                  # 라우터 설정
+├── config.rs               # 환경변수
+├── constants.rs            # 상수 (BATCH_INSERT_SIZE)
+├── state.rs                # 애플리케이션 상태
+├── handlers/
+│   ├── message_handlers.rs # 이메일 발송 API
+│   ├── event_handlers.rs   # SNS 이벤트, 오픈 트래킹
+│   ├── health_handlers.rs  # 헬스 체크
+│   └── topic_handlers.rs   # 토픽 관리
+├── services/
+│   ├── scheduler.rs        # 예약 이메일 조회
+│   ├── receiver.rs         # Rate-limited 발송, 배치 업데이트
+│   └── sender.rs           # AWS SES API 호출
+├── models/
+│   ├── content.rs          # EmailContent
+│   ├── request.rs          # EmailRequest (Arc<String>)
+│   └── result.rs           # EmailResult
+├── middlewares/
+│   └── auth_middlewares.rs # API Key 인증
+└── tests/                  # 테스트
 ```
 
-## 📊 모니터링
+---
 
-### 로그 레벨
+## 개발
+
+### 코드 스타일
+
+```bash
+cargo fmt                   # 포맷팅
+cargo clippy               # 린터
+```
+
+### 빌드
+
+```bash
+cargo build                # 개발
+cargo build --release      # 릴리즈
+cargo check                # 검사만
+```
+
+### 테스트
+
+```bash
+cargo test                      # 전체 테스트
+cargo test -- --nocapture      # 출력 포함
+cargo test test_save_batch     # 특정 테스트
+```
+
+### 모니터링
+
 ```bash
 RUST_LOG=debug cargo run  # 상세 로그
 RUST_LOG=info cargo run   # 일반 운영
 RUST_LOG=warn cargo run   # 경고만
 ```
 
-### 헬스 체크
-```bash
-# 기본 헬스 체크 (인증 불필요)
-curl http://localhost:3000/health
-
-# DB 연결 확인 포함 (인증 불필요)
-curl http://localhost:3000/ready
-
-# 발송 건수 조회
-curl http://localhost:3000/v1/events/counts/sent \
-  -H "X-API-KEY: $API_KEY"
-```
-
-## 📁 프로젝트 구조
-
-```
-src/
-├── main.rs                 # 진입점, 초기화, Graceful Shutdown
-├── app.rs                  # 라우터 설정
-├── config.rs               # 환경변수 관리
-├── constants.rs            # 공용 상수 (BATCH_INSERT_SIZE)
-├── state.rs                # 애플리케이션 상태
-├── handlers/               # HTTP 요청 핸들러
-│   ├── message_handlers.rs # 이메일 발송 API
-│   ├── event_handlers.rs   # SNS 이벤트, 오픈 트래킹
-│   ├── health_handlers.rs  # 헬스 체크 (/health, /ready)
-│   └── topic_handlers.rs   # 토픽 관리
-├── services/               # 백그라운드 서비스
-│   ├── scheduler.rs        # 예약 이메일 조회
-│   ├── receiver.rs         # Rate-limited 발송, 배치 업데이트
-│   └── sender.rs           # AWS SES API 호출, 재시도 로직
-├── models/                 # 데이터 모델
-│   ├── content.rs          # EmailContent (subject, content 저장)
-│   ├── request.rs          # EmailRequest (Arc<String> 최적화)
-│   └── result.rs           # EmailResult
-├── middlewares/            # HTTP 미들웨어
-│   └── auth_middlewares.rs # API Key 인증
-└── tests/                  # 단위 및 통합 테스트
-```
-
-## 🛠 개발 가이드
-
-### 코드 스타일
-
-이 프로젝트는 Rust 공식 스타일 가이드를 따릅니다:
-
-```bash
-# 코드 포맷팅
-cargo fmt
-
-# 린터 실행
-cargo clippy
-
-# 모든 검사 실행
-cargo clippy -- -W clippy::all -W clippy::pedantic -W clippy::nursery
-```
-
-**Lint 설정 (Cargo.toml):**
-```toml
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
-```
-
 ### 주요 의존성
 
 | 크레이트 | 용도 |
-|-------|---------|
-| `axum` | 웹 프레임워크 |
-| `tokio` | 비동기 런타임 |
-| `sqlx` | 데이터베이스 (SQLite) |
-| `aws-sdk-sesv2` | AWS SES API |
-| `serde` / `serde_json` | 직렬화 |
-| `thiserror` | 에러 처리 |
-| `tracing` | 로깅 |
-| `sentry` | 에러 트래킹 |
+|---------|------|
+| axum | 웹 프레임워크 |
+| tokio | 비동기 런타임 |
+| sqlx | SQLite |
+| aws-sdk-sesv2 | AWS SES |
+| serde | 직렬화 |
+| tracing | 로깅 |
+| sentry | 에러 트래킹 |
 
-### 빌드
+---
 
-```bash
-# 개발 빌드
-cargo build
-
-# 릴리즈 빌드 (최적화)
-cargo build --release
-
-# 빌드 없이 검사만
-cargo check
-```
-
-## 📚 참고 자료
+## 참고 자료
 
 - [AWS SES 개발자 가이드](https://docs.aws.amazon.com/ses/latest/dg/Welcome.html)
 - [AWS SNS 개발자 가이드](https://docs.aws.amazon.com/sns/latest/dg/welcome.html)
 - [Axum 문서](https://docs.rs/axum)
 - [SQLx 문서](https://docs.rs/sqlx)
-- [Rust API 가이드라인](https://rust-lang.github.io/api-guidelines/)
 
-## 📄 라이선스
+## 라이선스
 
 MIT License

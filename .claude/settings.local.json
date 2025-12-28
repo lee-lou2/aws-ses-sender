@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(~/.cargo/bin/cargo test)",
-      "Bash(~/.cargo/bin/cargo clippy:*)"
-    ]
-  }
-}

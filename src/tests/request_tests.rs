@@ -678,4 +678,513 @@ mod tests {
         assert!(!row1.0.is_empty());
         assert!(!row2.0.is_empty());
     }
+
+    // === Field validation edge case tests ===
+
+    #[tokio::test]
+    async fn test_save_with_long_email() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        // Email with 254 characters (just under typical limit)
+        let long_local = "a".repeat(64);
+        let long_domain = format!("{}.com", "b".repeat(185));
+        let long_email = format!("{long_local}@{long_domain}");
+
+        let req = EmailRequest {
+            id: None,
+            topic_id: Some("long_email_test".to_string()),
+            content_id: Some(content.id.unwrap()),
+            email: long_email.clone(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
+            scheduled_at: None,
+            status: EmailMessageStatus::Created as i32,
+            error: None,
+            message_id: None,
+        };
+
+        let saved = req.save(&db).await.unwrap();
+        assert_eq!(saved.email, long_email);
+    }
+
+    #[tokio::test]
+    async fn test_save_with_unicode_email() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        // International email with unicode
+        let unicode_email = "用户@例子.测试".to_string();
+
+        let req = EmailRequest {
+            id: None,
+            topic_id: Some("unicode_test".to_string()),
+            content_id: Some(content.id.unwrap()),
+            email: unicode_email.clone(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
+            scheduled_at: None,
+            status: EmailMessageStatus::Created as i32,
+            error: None,
+            message_id: None,
+        };
+
+        let saved = req.save(&db).await.unwrap();
+        assert_eq!(saved.email, unicode_email);
+    }
+
+    #[tokio::test]
+    async fn test_save_with_special_characters_in_topic_id() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        let special_topic = "topic-with_special.chars:2024/01".to_string();
+
+        let req = EmailRequest {
+            id: None,
+            topic_id: Some(special_topic.clone()),
+            content_id: Some(content.id.unwrap()),
+            email: "test@example.com".to_string(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
+            scheduled_at: None,
+            status: EmailMessageStatus::Created as i32,
+            error: None,
+            message_id: None,
+        };
+
+        let saved = req.save(&db).await.unwrap();
+        assert_eq!(saved.topic_id, Some(special_topic));
+    }
+
+    #[tokio::test]
+    async fn test_save_with_empty_topic_id() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        let req = EmailRequest {
+            id: None,
+            topic_id: Some(String::new()), // Empty string
+            content_id: Some(content.id.unwrap()),
+            email: "test@example.com".to_string(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
+            scheduled_at: None,
+            status: EmailMessageStatus::Created as i32,
+            error: None,
+            message_id: None,
+        };
+
+        let saved = req.save(&db).await.unwrap();
+        assert_eq!(saved.topic_id, Some(String::new()));
+    }
+
+    #[tokio::test]
+    async fn test_save_with_none_topic_id_should_fail() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        let req = EmailRequest {
+            id: None,
+            topic_id: None,
+            content_id: Some(content.id.unwrap()),
+            email: "test@example.com".to_string(),
+            subject: Arc::new(String::new()),
+            content: Arc::new(String::new()),
+            scheduled_at: None,
+            status: EmailMessageStatus::Created as i32,
+            error: None,
+            message_id: None,
+        };
+
+        // topic_id has NOT NULL constraint in database, so save should fail
+        let result = req.save(&db).await;
+        assert!(result.is_err(), "Saving with None topic_id should fail due to NOT NULL constraint");
+    }
+
+    #[tokio::test]
+    async fn test_save_with_long_error_message() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        let long_error = "Error: ".to_string() + &"x".repeat(500);
+
+        let mut req = create_test_request_with_content_id(content.id.unwrap())
+            .save(&db)
+            .await
+            .unwrap();
+
+        req.status = EmailMessageStatus::Failed as i32;
+        req.error = Some(long_error.clone());
+        req.update(&db).await.unwrap();
+
+        let row: (Option<String>,) = sqlx::query_as("SELECT error FROM email_requests WHERE id = ?")
+            .bind(req.id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        assert!(row.0.is_some());
+        assert!(row.0.unwrap().len() > 100);
+    }
+
+    // === Batch INSERT ID calculation edge case tests ===
+
+    #[tokio::test]
+    async fn test_save_batch_exactly_batch_size() {
+        use crate::constants::BATCH_INSERT_SIZE;
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        let requests: Vec<EmailRequest> = (0..BATCH_INSERT_SIZE)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("exact_batch".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        assert_eq!(saved.len(), BATCH_INSERT_SIZE);
+
+        // Verify IDs are sequential
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, req) in saved.iter().enumerate() {
+            assert_eq!(req.id, Some((i + 1) as i32));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_batch_one_over_batch_size() {
+        use crate::constants::BATCH_INSERT_SIZE;
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // BATCH_INSERT_SIZE + 1 to test boundary crossing
+        let count = BATCH_INSERT_SIZE + 1;
+        let requests: Vec<EmailRequest> = (0..count)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("boundary_batch".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        assert_eq!(saved.len(), count);
+
+        // Verify all IDs are sequential across chunk boundary
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, req) in saved.iter().enumerate() {
+            assert_eq!(
+                req.id,
+                Some((i + 1) as i32),
+                "ID mismatch at index {i}: expected {}, got {:?}",
+                i + 1,
+                req.id
+            );
+        }
+
+        // Verify in database
+        let count_db: (i32,) = sqlx::query_as("SELECT COUNT(*) FROM email_requests")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count_db.0, count as i32);
+    }
+
+    #[tokio::test]
+    async fn test_save_batch_two_full_batches() {
+        use crate::constants::BATCH_INSERT_SIZE;
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // Exactly 2 full batches
+        let count = BATCH_INSERT_SIZE * 2;
+        let requests: Vec<EmailRequest> = (0..count)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("two_batches".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        assert_eq!(saved.len(), count);
+
+        // Verify sequential IDs across two chunks
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, req) in saved.iter().enumerate() {
+            assert_eq!(req.id, Some((i + 1) as i32));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_save_batch_preserves_order() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        let emails: Vec<String> = vec![
+            "alpha@test.com",
+            "beta@test.com",
+            "gamma@test.com",
+            "delta@test.com",
+            "epsilon@test.com",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let requests: Vec<EmailRequest> = emails
+            .iter()
+            .map(|email| EmailRequest {
+                id: None,
+                topic_id: Some("order_test".to_string()),
+                content_id: Some(content_id),
+                email: email.clone(),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        // Verify order is preserved
+        for (i, req) in saved.iter().enumerate() {
+            assert_eq!(req.email, emails[i]);
+        }
+    }
+
+    // === Large dataset tests ===
+
+    #[tokio::test]
+    async fn test_save_batch_1000_records() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        let requests: Vec<EmailRequest> = (0..1000)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("large_1000".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        assert_eq!(saved.len(), 1000);
+
+        // Verify first and last IDs
+        assert_eq!(saved.first().unwrap().id, Some(1));
+        assert_eq!(saved.last().unwrap().id, Some(1000));
+
+        // Verify in database
+        let count: (i32,) = sqlx::query_as("SELECT COUNT(*) FROM email_requests")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_get_request_counts_large_topic() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // Create 500 requests with various statuses
+        let requests: Vec<EmailRequest> = (0..500)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("large_counts".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: (i % 5) as i32, // Distribute across all statuses
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        let counts = EmailRequest::get_request_counts_by_topic_id(&db, "large_counts")
+            .await
+            .unwrap();
+
+        // Each status should have 100 records (500 / 5)
+        assert_eq!(counts.get("Created"), Some(&100));
+        assert_eq!(counts.get("Processed"), Some(&100));
+        assert_eq!(counts.get("Sent"), Some(&100));
+        assert_eq!(counts.get("Failed"), Some(&100));
+        assert_eq!(counts.get("Stopped"), Some(&100));
+    }
+
+    #[tokio::test]
+    async fn test_stop_topic_large_batch() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // Create 300 requests all with Created status
+        let requests: Vec<EmailRequest> = (0..300)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("stop_large".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        EmailRequest::save_batch(requests, &db).await.unwrap();
+
+        // Stop all
+        EmailRequest::stop_topic(&db, "stop_large").await.unwrap();
+
+        let counts = EmailRequest::get_request_counts_by_topic_id(&db, "stop_large")
+            .await
+            .unwrap();
+
+        assert_eq!(counts.get("Stopped"), Some(&300));
+        assert!(counts.get("Created").is_none());
+    }
+
+    // === Arc<String> memory efficiency tests ===
+
+    #[tokio::test]
+    async fn test_arc_string_sharing() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // Create shared Arc<String> for subject and content
+        let shared_subject = Arc::new("Shared Subject".to_string());
+        let shared_content = Arc::new("Shared Content".to_string());
+
+        let requests: Vec<EmailRequest> = (0..10)
+            .map(|i| EmailRequest {
+                id: None,
+                topic_id: Some("arc_test".to_string()),
+                content_id: Some(content_id),
+                email: format!("user{i}@example.com"),
+                subject: Arc::clone(&shared_subject),
+                content: Arc::clone(&shared_content),
+                scheduled_at: None,
+                status: EmailMessageStatus::Created as i32,
+                error: None,
+                message_id: None,
+            })
+            .collect();
+
+        // Verify all requests share the same Arc
+        assert_eq!(Arc::strong_count(&shared_subject), 11); // 10 requests + original
+        assert_eq!(Arc::strong_count(&shared_content), 11);
+
+        let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
+        assert_eq!(saved.len(), 10);
+
+        // After save, the saved copies should still share the Arc
+        for req in &saved {
+            assert!(Arc::ptr_eq(&req.subject, &shared_subject));
+            assert!(Arc::ptr_eq(&req.content, &shared_content));
+        }
+    }
+
+    // === Foreign key constraint tests ===
+
+    #[tokio::test]
+    async fn test_save_with_valid_content_id() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+
+        let req = create_test_request_with_content_id(content.id.unwrap());
+        let saved = req.save(&db).await.unwrap();
+
+        assert!(saved.id.is_some());
+        assert_eq!(saved.content_id, content.id);
+    }
+
+    #[tokio::test]
+    async fn test_sent_count_with_various_hours() {
+        let db = setup_db().await;
+        let content = create_test_content().save(&db).await.unwrap();
+        let content_id = content.id.unwrap();
+
+        // Create some sent emails
+        for _ in 0..5 {
+            let mut req = create_test_request_with_content_id(content_id)
+                .save(&db)
+                .await
+                .unwrap();
+            req.status = EmailMessageStatus::Sent as i32;
+            req.update(&db).await.unwrap();
+        }
+
+        // Test with different hour values
+        let count_1h = EmailRequest::sent_count(&db, 1).await.unwrap();
+        let count_24h = EmailRequest::sent_count(&db, 24).await.unwrap();
+        let count_168h = EmailRequest::sent_count(&db, 168).await.unwrap(); // 1 week
+
+        // All should return 5 since records were just created
+        assert_eq!(count_1h, 5);
+        assert_eq!(count_24h, 5);
+        assert_eq!(count_168h, 5);
+    }
+
+    #[tokio::test]
+    async fn test_sent_count_zero_hours() {
+        let db = setup_db().await;
+
+        // Edge case: 0 hours should still work
+        let count = EmailRequest::sent_count(&db, 0).await.unwrap();
+        assert_eq!(count, 0);
+    }
 }

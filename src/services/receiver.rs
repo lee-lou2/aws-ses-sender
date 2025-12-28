@@ -740,4 +740,278 @@ mod tests {
         let result = bulk_update_all(&db, &[]).await;
         assert!(result.is_ok());
     }
+
+    // === Concurrency tests for Token Bucket ===
+
+    #[tokio::test]
+    async fn test_token_bucket_concurrent_acquire() {
+        use std::sync::atomic::AtomicUsize;
+
+        let bucket = Arc::new(TokenBucket::new(5));
+        let acquired_count = Arc::new(AtomicUsize::new(0));
+
+        // Spawn 10 tasks trying to acquire tokens
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let bucket_clone = Arc::clone(&bucket);
+            let count_clone = Arc::clone(&acquired_count);
+            handles.push(tokio::spawn(async move {
+                if bucket_clone.try_acquire() {
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        // Only 5 should have succeeded
+        assert_eq!(acquired_count.load(Ordering::SeqCst), 5);
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_concurrent_acquire_with_refill() {
+        let bucket = Arc::new(TokenBucket::new(2));
+        let acquired_count = Arc::new(AtomicU64::new(0));
+
+        // Spawn 6 tasks trying to acquire (2 immediately, 4 should wait for refill)
+        let mut handles = vec![];
+        for _ in 0..6 {
+            let bucket_clone = Arc::clone(&bucket);
+            let count_clone = Arc::clone(&acquired_count);
+            handles.push(tokio::spawn(async move {
+                bucket_clone.acquire().await;
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        // Give time for initial acquires
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Should have acquired 2 immediately
+        assert!(acquired_count.load(Ordering::SeqCst) >= 2);
+
+        // Refill to allow more
+        bucket.refill(2);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        bucket.refill(2);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // All should complete eventually
+        for handle in handles {
+            tokio::time::timeout(Duration::from_millis(100), handle)
+                .await
+                .expect("all acquires should complete")
+                .unwrap();
+        }
+
+        assert_eq!(acquired_count.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_reset_wakes_waiters() {
+        let bucket = Arc::new(TokenBucket::new(1));
+
+        // Consume the only token
+        bucket.acquire().await;
+
+        let bucket_clone = Arc::clone(&bucket);
+        let handle = tokio::spawn(async move {
+            bucket_clone.acquire().await;
+        });
+
+        // Allow spawn to start waiting
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Reset should wake up the waiter
+        bucket.reset();
+
+        // Should complete within reasonable time
+        tokio::time::timeout(Duration::from_millis(100), handle)
+            .await
+            .expect("acquire should complete after reset")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_multiple_refills() {
+        let bucket = TokenBucket::new(10);
+
+        // Consume all tokens
+        for _ in 0..10 {
+            assert!(bucket.try_acquire());
+        }
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 0);
+
+        // Multiple small refills
+        bucket.refill(3);
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 3);
+
+        bucket.refill(3);
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 6);
+
+        bucket.refill(3);
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 9);
+
+        bucket.refill(3);
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 10); // Capped at max
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_stress_acquire_refill() {
+        let bucket = Arc::new(TokenBucket::new(10));
+        let total_acquired = Arc::new(AtomicU64::new(0));
+
+        // Spawn multiple acquire tasks
+        let mut acquire_handles = vec![];
+        for _ in 0..20 {
+            let bucket_clone = Arc::clone(&bucket);
+            let count_clone = Arc::clone(&total_acquired);
+            acquire_handles.push(tokio::spawn(async move {
+                bucket_clone.acquire().await;
+                count_clone.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+
+        // Refill periodically
+        let bucket_refill = Arc::clone(&bucket);
+        let refill_handle = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                bucket_refill.refill(5);
+            }
+        });
+
+        refill_handle.await.unwrap();
+
+        // Wait for all acquires with timeout
+        for handle in acquire_handles {
+            tokio::time::timeout(Duration::from_millis(500), handle)
+                .await
+                .expect("acquire should complete")
+                .unwrap();
+        }
+
+        assert_eq!(total_acquired.load(Ordering::SeqCst), 20);
+    }
+
+    #[test]
+    fn test_token_bucket_try_acquire_atomic() {
+        let bucket = TokenBucket::new(1);
+
+        // First try should succeed
+        assert!(bucket.try_acquire());
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 0);
+
+        // Second try should fail
+        assert!(!bucket.try_acquire());
+        assert_eq!(bucket.tokens.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_large_batch() {
+        let db = setup_db().await;
+        let content_id = insert_test_content(&db).await;
+
+        // Insert 100 requests
+        for i in 1..=100 {
+            insert_test_request(&db, content_id, i).await;
+        }
+
+        // Create batch with all Sent status
+        let batch: Vec<EmailRequest> = (1..=100)
+            .map(|i| EmailRequest {
+                id: Some(i),
+                topic_id: Some("bulk_test".to_string()),
+                content_id: Some(content_id as i32),
+                email: format!("test{i}@test.com"),
+                subject: Arc::new(String::new()),
+                content: Arc::new(String::new()),
+                scheduled_at: None,
+                status: EmailMessageStatus::Sent as i32,
+                message_id: Some(format!("msg_{i}")),
+                error: None,
+            })
+            .collect();
+
+        bulk_update_all(&db, &batch).await.unwrap();
+
+        // Verify all updated
+        let count: (i32,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM email_requests WHERE status = ? AND message_id IS NOT NULL",
+        )
+        .bind(EmailMessageStatus::Sent as i32)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(count.0, 100);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_update_mixed_statuses_large() {
+        let db = setup_db().await;
+        let content_id = insert_test_content(&db).await;
+
+        // Insert 50 requests
+        for i in 1..=50 {
+            insert_test_request(&db, content_id, i).await;
+        }
+
+        // Create batch with alternating Sent/Failed statuses
+        let batch: Vec<EmailRequest> = (1..=50)
+            .map(|i| {
+                if i % 2 == 0 {
+                    EmailRequest {
+                        id: Some(i),
+                        topic_id: Some("mixed_test".to_string()),
+                        content_id: Some(content_id as i32),
+                        email: format!("test{i}@test.com"),
+                        subject: Arc::new(String::new()),
+                        content: Arc::new(String::new()),
+                        scheduled_at: None,
+                        status: EmailMessageStatus::Sent as i32,
+                        message_id: Some(format!("msg_{i}")),
+                        error: None,
+                    }
+                } else {
+                    EmailRequest {
+                        id: Some(i),
+                        topic_id: Some("mixed_test".to_string()),
+                        content_id: Some(content_id as i32),
+                        email: format!("test{i}@test.com"),
+                        subject: Arc::new(String::new()),
+                        content: Arc::new(String::new()),
+                        scheduled_at: None,
+                        status: EmailMessageStatus::Failed as i32,
+                        message_id: None,
+                        error: Some(format!("Error for {i}")),
+                    }
+                }
+            })
+            .collect();
+
+        bulk_update_all(&db, &batch).await.unwrap();
+
+        // Verify counts
+        let sent_count: (i32,) =
+            sqlx::query_as("SELECT COUNT(*) FROM email_requests WHERE status = ?")
+                .bind(EmailMessageStatus::Sent as i32)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+
+        let failed_count: (i32,) =
+            sqlx::query_as("SELECT COUNT(*) FROM email_requests WHERE status = ?")
+                .bind(EmailMessageStatus::Failed as i32)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+
+        assert_eq!(sent_count.0, 25);
+        assert_eq!(failed_count.0, 25);
+    }
 }
