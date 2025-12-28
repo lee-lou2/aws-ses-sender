@@ -14,6 +14,9 @@
 - 📊 **Event Tracking**: Receive Bounce/Complaint/Delivery events via AWS SNS
 - 👀 **Open Tracking**: Track email opens via 1x1 transparent pixel
 - ⚡ **Rate Limiting**: Token Bucket + Semaphore-based sends per second control
+- 🔐 **API Key Authentication**: Secure API access via X-API-KEY header
+- 📊 **Sentry Integration**: Real-time error tracking and monitoring
+- 🚀 **High-Performance Allocator**: Uses mimalloc
 
 ### Tech Stack
 | Area | Technology |
@@ -25,6 +28,7 @@
 | Email Service | AWS SES v2 |
 | Authentication | X-API-KEY header |
 | Error Tracking | Sentry |
+| Memory Allocator | mimalloc |
 
 ---
 
@@ -55,11 +59,15 @@
 ├── migrations/             # SQLx database migrations (auto-applied on startup)
 │   └── 20241228000000_initial_schema.sql
 ├── src/
-│   ├── main.rs                 # Entry point, migrations, graceful shutdown
+│   ├── main.rs                 # Entry point, mimalloc, graceful shutdown
 │   ├── app.rs                  # Axum router setup
-│   ├── config.rs               # Environment variable loading (singleton)
+│   ├── error.rs                # Centralized error handling (AppError, AppResult)
 │   ├── constants.rs            # Shared constants (BATCH_INSERT_SIZE)
 │   ├── state.rs                # AppState definition (DB pool, channels)
+│   ├── config/                 # Configuration module
+│   │   ├── mod.rs              # Module exports
+│   │   ├── env.rs              # Environment variable loading (AppConfig)
+│   │   └── db.rs               # Database connection pool management
 │   ├── handlers/               # HTTP request handlers
 │   │   ├── mod.rs
 │   │   ├── message_handlers.rs # POST /v1/messages
@@ -76,19 +84,9 @@
 │   │   ├── content.rs          # EmailContent (subject, content storage)
 │   │   ├── request.rs          # EmailRequest, EmailMessageStatus
 │   │   └── result.rs           # EmailResult
-│   ├── middlewares/            # HTTP middlewares
-│   │   ├── mod.rs
-│   │   └── auth_middlewares.rs # API Key authentication
-│   └── tests/                  # Tests
-│       ├── mod.rs              # Shared helper functions
-│       ├── auth_tests.rs
-│       ├── event_tests.rs
-│       ├── handler_tests.rs
-│       ├── health_tests.rs
-│       ├── request_tests.rs
-│       ├── scheduler_tests.rs
-│       ├── status_tests.rs
-│       └── topic_tests.rs
+│   └── middlewares/            # HTTP middlewares
+│       ├── mod.rs
+│       └── auth_middlewares.rs # API Key authentication
 └── Cargo.toml
 ```
 
@@ -98,10 +96,53 @@
 
 ### `src/main.rs`
 - Application entry point
-- Logger, Sentry, DB initialization
-- SQLx migrations auto-applied via `sqlx::migrate!()`
+- mimalloc global allocator setup (non-MSVC targets)
+- Logger, Sentry initialization
+- SQLx migrations auto-applied via config/db.rs
 - Spawns 3 background tasks
 - Graceful shutdown with `tokio::signal::ctrl_c()`
+
+### `src/error.rs`
+**Centralized Error Handling** - All errors are converted to `AppError`
+
+```rust
+#[derive(Error, Debug)]
+pub enum AppError {
+    BadRequest(String),      // 400
+    Unauthorized(String),    // 401
+    NotFound(String),        // 404
+    Validation(String),      // 400
+    Internal(String),        // 500
+    Database(#[from] sqlx::Error),
+    Email(String),
+    ChannelClosed,
+}
+
+pub type AppResult<T> = Result<T, AppError>;
+```
+
+### `src/config/`
+**Configuration Module** - Environment variables and database management
+
+```rust
+// env.rs - Environment variable helpers
+pub fn get_env(key: &str, default: Option<&str>) -> String;
+pub fn get_env_parsed<T: FromStr>(key: &str, default: T) -> T;
+
+// AppConfig - All settings in one struct
+pub struct AppConfig {
+    pub server_port: String,
+    pub max_send_per_second: i32,
+    pub db_max_connections: u32,
+    // ...
+}
+
+pub static APP_CONFIG: Lazy<AppConfig> = Lazy::new(AppConfig::from_env);
+
+// db.rs - Database pool management
+pub async fn init_db() -> Result<SqlitePool, sqlx::Error>;
+pub async fn close_db();
+```
 
 ### `src/services/receiver.rs`
 **Most complex module** - Handles rate limiting and concurrency control
@@ -189,8 +230,8 @@ pub enum EmailMessageStatus {
 
 | Method | Path | Auth | Handler Function |
 |--------|------|------|-------------|
-| GET | `/health` | ❌ | `health_check` |
-| GET | `/ready` | ❌ | `readiness_check` |
+| GET | `/health` | ❌ | `health` |
+| GET | `/ready` | ❌ | `ready` |
 | POST | `/v1/messages` | ✅ | `create_message` |
 | GET | `/v1/topics/{topic_id}` | ✅ | `get_topic` |
 | DELETE | `/v1/topics/{topic_id}` | ✅ | `stop_topic` |
@@ -202,16 +243,44 @@ pub enum EmailMessageStatus {
 
 ## ⚙️ Environment Variables
 
+### Server Configuration
 | Variable | Required | Default | Description |
-|------|------|--------|------|
+|------|:------:|--------|------|
 | `SERVER_PORT` | ❌ | 8080 | Server port |
 | `SERVER_URL` | ✅ | - | External access URL |
 | `API_KEY` | ✅ | - | API authentication key |
+| `RUST_LOG` | ❌ | info | Log level |
+
+### AWS Configuration
+| Variable | Required | Default | Description |
+|------|:------:|--------|------|
 | `AWS_REGION` | ❌ | ap-northeast-2 | AWS region |
 | `AWS_SES_FROM_EMAIL` | ✅ | - | Sender email |
+
+### Rate Limiting
+| Variable | Required | Default | Description |
+|------|:------:|--------|------|
 | `MAX_SEND_PER_SECOND` | ❌ | 24 | Maximum sends per second |
+
+### Database Configuration
+| Variable | Required | Default | Description |
+|------|:------:|--------|------|
+| `DB_MAX_CONNECTIONS` | ❌ | 20 | Maximum connections |
+| `DB_MIN_CONNECTIONS` | ❌ | 5 | Minimum connections |
+| `DB_ACQUIRE_TIMEOUT_SECS` | ❌ | 30 | Connection acquire timeout (seconds) |
+| `DB_IDLE_TIMEOUT_SECS` | ❌ | 300 | Idle connection timeout (seconds) |
+
+### Channel Configuration
+| Variable | Required | Default | Description |
+|------|:------:|--------|------|
+| `SEND_CHANNEL_BUFFER` | ❌ | 10,000 | Send channel buffer size |
+| `POST_SEND_CHANNEL_BUFFER` | ❌ | 1,000 | Post-send channel buffer size |
+
+### Monitoring
+| Variable | Required | Default | Description |
+|------|:------:|--------|------|
 | `SENTRY_DSN` | ❌ | - | Sentry DSN |
-| `RUST_LOG` | ❌ | info | Log level |
+| `SENTRY_TRACES_SAMPLE_RATE` | ❌ | 0.1 | Sentry trace sampling rate |
 
 ---
 
@@ -236,7 +305,7 @@ cargo fmt
 
 ### Database Migrations
 
-Migrations are automatically applied on server startup via `sqlx::migrate!()`.
+Migrations are automatically applied on server startup via `config/db.rs`.
 
 ```bash
 # Install SQLx CLI (optional, for manual migration management)
@@ -253,11 +322,10 @@ sqlx migrate info
 
 | Constant | Value | Location |
 |------|-----|------|
-| `DB_MAX_CONNECTIONS` | 20 | main.rs |
-| `SEND_CHANNEL_BUFFER` | 10,000 | main.rs |
 | `BATCH_SIZE` (scheduler) | 1,000 | scheduler.rs |
 | `BATCH_INSERT_SIZE` | 150 | constants.rs |
 | `BATCH_FLUSH_INTERVAL_MS` | 500 | receiver.rs |
+| `TOKEN_REFILL_INTERVAL_MS` | 100 | receiver.rs |
 
 ---
 
@@ -265,16 +333,48 @@ sqlx migrate info
 
 > This project follows the [Rust Official Style Guide](https://doc.rust-lang.org/stable/style-guide/) and [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
 
-### Lint Settings
+### rustfmt.toml Configuration
+
+```toml
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+
+# Import configuration
+imports_granularity = "Module"
+group_imports = "StdExternalCrate"
+reorder_imports = true
+reorder_modules = true
+
+# Function and struct formatting
+fn_args_layout = "Tall"
+struct_lit_single_line = true
+
+# Comment formatting
+wrap_comments = true
+format_code_in_doc_comments = true
+doc_comment_code_block_width = 80
+```
+
+### Lint Configuration
 
 ```toml
 [lints.rust]
 unsafe_code = "forbid"
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allowed patterns
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+struct_field_names = "allow"
+similar_names = "allow"
 ```
 
 ### Naming Conventions
@@ -289,56 +389,44 @@ nursery = "warn"
 | Lifetimes | Short lowercase | `'a`, `'de` |
 | Type Parameters | Single uppercase or `PascalCase` | `T`, `E`, `Item` |
 
-### Module Documentation Comments
+### Error Handling
 
 ```rust
-// ✅ Good: Concise one-liner
-//! Email request model and database operations
+// ✅ Good: Use centralized AppError
+pub async fn get_topic(...) -> AppResult<impl IntoResponse> {
+    if topic_id.is_empty() {
+        return Err(AppError::BadRequest("topic_id is required".to_string()));
+    }
+    let counts = EmailRequest::get_counts(&state.db_pool, &topic_id).await?;
+    Ok(Json(counts))
+}
 
-// ❌ Bad: Unnecessarily long and verbose
-//! This module handles email request models and database operations.
-//! 
-//! ## Key Features
-//! - Save email requests
-//! - Retrieve email requests
-//! ...
+// ✅ Good: Use ? operator for error propagation
+let count = EmailRequest::sent_count(&state.db_pool, hours).await?;
+
+// ❌ Bad: Manual error handling in handlers
+match result {
+    Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, "Error").into_response(),
+}
 ```
 
-### Function Documentation Comments
+### Handler Function Patterns
 
 ```rust
-// ✅ Good: Concise when necessary
-/// Saves multiple requests in a single transaction using multi-row INSERT.
-///
-/// This provides ~10x performance improvement over individual inserts.
-pub async fn save_batch(requests: Vec<Self>, db_pool: &SqlitePool) -> Result<Vec<Self>, sqlx::Error>
-
-// ✅ Good: Simple functions can omit documentation
-pub async fn update(&self, db_pool: &SqlitePool) -> Result<(), sqlx::Error>
-
-// ❌ Bad: Repeating what's obvious from the code
-/// This function updates the email request in the database
-/// It takes a database pool and updates the request
-pub async fn update(&self, db_pool: &SqlitePool) -> Result<(), sqlx::Error>
-```
-
-### No Separator Comments
-
-```rust
-// ❌ Bad: Using separator comments
-// =============================================================================
-// Configuration
-// =============================================================================
-const BATCH_SIZE: usize = 100;
-
-// ✅ Good: Group related constants (separated by blank lines)
-// Token bucket configuration
-const TOKEN_REFILL_INTERVAL_MS: u64 = 100;
-const TOKEN_WAIT_INTERVAL_MS: u64 = 5;
-
-// Batch update configuration
-const BATCH_SIZE: usize = 100;
-const BATCH_FLUSH_INTERVAL_MS: u64 = 500;
+// ✅ Good: Return AppResult<impl IntoResponse>
+pub async fn get_topic(
+    State(state): State<AppState>,
+    Path(topic_id): Path<String>,
+) -> AppResult<impl IntoResponse> {
+    // Validation
+    if topic_id.is_empty() {
+        return Err(AppError::BadRequest("topic_id is required".to_string()));
+    }
+    // Business logic
+    let counts = EmailRequest::get_counts(&state.db_pool, &topic_id).await?;
+    Ok(Json(counts))
+}
 ```
 
 ### Import Organization
@@ -348,146 +436,64 @@ const BATCH_FLUSH_INTERVAL_MS: u64 = 500;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode};
+use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
+use crate::error::{AppError, AppResult};
 use crate::models::request::EmailRequest;
 use crate::state::AppState;
-```
-
-### Error Handling
-
-```rust
-// ✅ Good: Use thiserror
-#[derive(Debug, Error)]
-pub enum SendEmailError {
-    #[error("Failed to build email: {0}")]
-    Build(String),
-
-    #[error("SES SDK error: {0}")]
-    Sdk(String),
-}
-
-// ✅ Good: Use let-else pattern
-let Some(ses_msg_id) = ses_msg_id else {
-    error!("SES message_id not found");
-    return (StatusCode::BAD_REQUEST, "Not found").into_response();
-};
-
-// ✅ Good: Use ? operator
-let row: (i64,) = sqlx::query_as("SELECT id FROM ...")
-    .bind(message_id)
-    .fetch_one(db_pool)
-    .await?;
-```
-
-### Conditional Compilation
-
-```rust
-// ✅ Good: Test-only functions
-#[cfg(test)]
-pub async fn save(self, db_pool: &SqlitePool) -> Result<Self, sqlx::Error> {
-    // Individual save logic used only in tests
-}
-```
-
-### Type Conversion
-
-```rust
-// ✅ Good: Explicit casting with allow attribute
-#[allow(clippy::cast_possible_truncation)]
-let id = row.0 as i32;
-
-// ✅ Good: Safe conversion
-let max_per_sec = u64::try_from(envs.max_send_per_second.max(1)).unwrap_or(1);
-```
-
-### Handler Function Naming
-
-```rust
-// ✅ Good: Concise names starting with verbs
-pub async fn create_message(...) -> impl IntoResponse
-pub async fn get_topic(...) -> impl IntoResponse
-pub async fn stop_topic(...) -> impl IntoResponse
-pub async fn track_open(...) -> impl IntoResponse
-pub async fn handle_sns_event(...) -> impl IntoResponse
-
-// ❌ Bad: Unnecessary suffixes
-pub async fn create_message_handler(...) -> impl IntoResponse
-pub async fn retrieve_topic_handler(...) -> impl IntoResponse
-```
-
-### Middleware Naming
-
-```rust
-// ✅ Good: Concise name
-pub async fn api_key_auth(req: Request<Body>, next: Next) -> impl IntoResponse
-
-// ❌ Bad: Unnecessary suffix
-pub async fn api_key_auth_middleware(req: Request<Body>, next: Next) -> impl IntoResponse
-```
-
-### Constant Definitions
-
-```rust
-// ✅ Good: Group related constants at module top
-const MAX_BODY_SIZE: usize = 1024 * 1024; // 1MB
-
-/// 1x1 transparent PNG for email open tracking
-const TRACKING_PIXEL: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, ...
-];
-
-// ✅ Good: Comments only when necessary
-const DB_MAX_CONNECTIONS: u32 = 20;
-const DB_MIN_CONNECTIONS: u32 = 5;
 ```
 
 ---
 
 ## 🧪 Test Code Style Guide
 
-### Test File Structure
+### Test Structure
+
+Tests are now inline in each module using `#[cfg(test)] mod tests`:
+
+```rust
+// At the bottom of each module file
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_function_name_scenario() {
+        // Arrange
+        let input = "test_input";
+        
+        // Act
+        let result = function_under_test(input);
+        
+        // Assert
+        assert!(result.is_ok());
+    }
+}
+```
+
+### Async Test Pattern
 
 ```rust
 #[cfg(test)]
 mod tests {
-    use crate::models::request::EmailRequest;
-    use crate::tests::helpers::{get_api_key, setup_db};
-    // ... other imports
+    use super::*;
 
-    // Test functions
-}
-```
-
-### Shared Helper Functions
-
-Define shared helpers in `tests/mod.rs`:
-
-```rust
-#[cfg(test)]
-pub mod helpers {
-    use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
-
-    pub async fn setup_db() -> SqlitePool {
+    async fn setup_db() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
             .await
             .unwrap();
-
-        // Create tables
-        sqlx::query("CREATE TABLE ...")
-            .execute(&pool)
-            .await
-            .unwrap();
-
+        // Create tables...
         pool
     }
 
-    pub fn get_api_key() -> String {
-        crate::config::get_environments().api_key.clone()
+    #[tokio::test]
+    async fn test_async_function() {
+        let db = setup_db().await;
+        let result = async_function(&db).await;
+        assert!(result.is_ok());
     }
 }
 ```
@@ -495,177 +501,47 @@ pub mod helpers {
 ### Test Function Naming
 
 ```rust
-// ✅ Good: test_ prefix + test target + expected result
-#[tokio::test]
-async fn test_save_returns_id() { }
+// ✅ Good: test_ prefix + function_name + scenario
+#[test]
+fn test_app_error_bad_request_display() { }
 
 #[tokio::test]
-async fn test_sent_count_empty() { }
-
-#[tokio::test]
-async fn test_stop_topic_updates_created_only() { }
+async fn test_bulk_update_all_unified() { }
 
 // ❌ Bad: Unclear or overly long names
-#[tokio::test]
-async fn test1() { }
+#[test]
+fn test1() { }
 
-#[tokio::test]
-async fn test_that_when_we_save_an_email_request_it_should_return_the_id() { }
+#[test]
+fn test_that_when_validating_it_should_fail_if_invalid() { }
 ```
 
-### Test Helper Functions
+---
 
-```rust
-// ✅ Good: Content creation helper
-fn create_test_content() -> EmailContent {
-    EmailContent {
-        id: None,
-        subject: "Test Subject".to_string(),
-        content: "<p>Test Content</p>".to_string(),
-    }
-}
+## 🤖 AI Agent Guidelines
 
-// ✅ Good: Create request with content_id (Arc<String> for memory efficiency)
-fn create_test_request_with_content_id(content_id: i32) -> EmailRequest {
-    EmailRequest {
-        id: None,
-        topic_id: Some("test_topic".to_string()),
-        content_id: Some(content_id),
-        email: "test@example.com".to_string(),
-        subject: Arc::new(String::new()),  // Loaded via JOIN at runtime
-        content: Arc::new(String::new()),  // Loaded via JOIN at runtime
-        scheduled_at: None,
-        status: EmailMessageStatus::Created as i32,
-        error: None,
-        message_id: None,
-    }
-}
+### DO's (Recommended Practices)
 
-// ✅ Good: Save content to DB then create request
-async fn create_test_request_with_db(db: &SqlitePool) -> EmailRequest {
-    let content = create_test_content().save(db).await.unwrap();
-    create_test_request_with_content_id(content.id.unwrap())
-}
-```
+1. **Always run `cargo check` or `cargo build`** after making changes
+2. **Run `cargo clippy`** to catch common mistakes
+3. **Run `cargo fmt`** to ensure consistent formatting
+4. **Run `cargo test`** after changes
+5. **Use `AppError` and `AppResult`** for error handling
+6. **Follow existing patterns** in the codebase
+7. **Use `#[must_use]`** for functions returning important values
+8. **Use `const fn`** for simple constructors
+9. **Leverage `Arc`** for sharing data across async tasks
 
-### API Test Pattern
+### DON'Ts (Avoid These)
 
-```rust
-#[tokio::test]
-async fn test_create_message_success() {
-    // 1. Setup
-    let db = setup_db().await;
-    let (tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = crate::app::app(AppState::new(db.clone(), tx));
-
-    // 2. Prepare request
-    let payload = serde_json::json!({
-        "messages": [{
-            "topic_id": "test",
-            "emails": ["user@test.com"],
-            "subject": "Hello",
-            "content": "<p>Test</p>"
-        }]
-    });
-
-    // 3. Execute
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/messages")
-                .method("POST")
-                .header("Content-Type", "application/json")
-                .header("X-API-KEY", get_api_key())
-                .body(Body::from(serde_json::to_string(&payload).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // 4. Assert
-    assert_eq!(response.status(), StatusCode::OK);
-}
-```
-
-### Database Test Pattern
-
-```rust
-#[tokio::test]
-async fn test_save_batch_multiple() {
-    let db = setup_db().await;
-    
-    // Arrange
-    let requests: Vec<EmailRequest> = (0..5)
-        .map(|i| EmailRequest {
-            id: None,
-            email: format!("user{i}@example.com"),
-            // ...
-        })
-        .collect();
-
-    // Act
-    let saved = EmailRequest::save_batch(requests, &db).await.unwrap();
-
-    // Assert
-    assert_eq!(saved.len(), 5);
-    for (i, req) in saved.iter().enumerate() {
-        assert_eq!(req.id, Some((i + 1) as i32));
-    }
-
-    // Verify in DB
-    let count: (i32,) = sqlx::query_as("SELECT COUNT(*) FROM email_requests")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(count.0, 5);
-}
-```
-
-### Assertion Style
-
-```rust
-// ✅ Good: Clear assertions
-assert_eq!(response.status(), StatusCode::OK);
-assert_eq!(saved.id, Some(1));
-assert!(counts.is_empty());
-
-// ✅ Good: Useful message on failure
-assert_eq!(counts.get("Created"), Some(&2), "Created count mismatch");
-
-// ❌ Bad: Unclear assertion
-assert!(response.status() == StatusCode::OK);
-```
-
-### Test Categories
-
-```
-tests/
-├── mod.rs              # Shared helpers
-├── auth_tests.rs       # Authentication tests
-├── event_tests.rs      # Event handler tests
-├── handler_tests.rs    # Message/topic handler tests
-├── request_tests.rs    # EmailRequest model tests
-├── scheduler_tests.rs  # Scheduler tests
-├── status_tests.rs     # EmailMessageStatus enum tests
-└── topic_tests.rs      # Topic handler tests
-```
-
-### Test Isolation
-
-```rust
-// ✅ Good: Each test uses an independent in-memory DB
-#[tokio::test]
-async fn test_independent_1() {
-    let db = setup_db().await;  // New in-memory DB
-    // ...
-}
-
-#[tokio::test]
-async fn test_independent_2() {
-    let db = setup_db().await;  // Separate in-memory DB
-    // ...
-}
-```
+1. **DON'T use `.unwrap()` or `.expect()`** in production code
+2. **DON'T add `unsafe` code** - it's forbidden via lint
+3. **DON'T ignore Clippy warnings**
+4. **DON'T bypass authentication middleware** for protected routes
+5. **DON'T use blocking operations** in async contexts
+6. **DON'T hardcode configuration values** - use `APP_CONFIG`
+7. **DON'T use `println!` for logging** - use `tracing` macros
+8. **DON'T create separate test files** - use inline tests
 
 ---
 
@@ -683,8 +559,28 @@ async fn test_independent_2() {
 1. **Branch Naming**: `feature/feature-name`, `fix/bug-name`
 2. **Commit Messages**: `[module-name] Summary of changes`
 3. **Tests Pass**: All `cargo test` must pass
-4. **Clippy Pass**: No `cargo clippy` warnings
+4. **Clippy Pass**: No `cargo clippy` warnings (including nursery)
 5. **Code Formatting**: Apply `cargo fmt`
+
+### Pre-commit Checklist
+
+```bash
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
+```
+
+---
+
+## 📚 References
+
+- [The Rust Programming Language Book](https://doc.rust-lang.org/book/)
+- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
+- [Rust Style Guide](https://doc.rust-lang.org/nightly/style-guide/)
+- [Clippy Lints](https://rust-lang.github.io/rust-clippy/master/)
+- [Axum Documentation](https://docs.rs/axum/latest/axum/)
+- [SQLx Documentation](https://docs.rs/sqlx/latest/sqlx/)
+- [AWS SDK for Rust](https://docs.rs/aws-sdk-sesv2/latest/aws_sdk_sesv2/)
 
 ---
 

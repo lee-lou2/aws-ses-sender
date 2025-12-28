@@ -2,16 +2,22 @@
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
     response::IntoResponse,
     Json,
 };
-use tracing::error;
 
 use crate::{
+    error::{AppError, AppResult},
     models::{request::EmailRequest, result::EmailResult},
     state::AppState,
 };
+
+/// Topic statistics response.
+#[derive(serde::Serialize)]
+struct TopicStatsResponse {
+    request_counts: std::collections::HashMap<String, i32>,
+    result_counts: std::collections::HashMap<String, i32>,
+}
 
 /// Returns email statistics for a specific topic.
 ///
@@ -19,9 +25,9 @@ use crate::{
 pub async fn get_topic(
     State(state): State<AppState>,
     Path(topic_id): Path<String>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     if topic_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "topic_id is required").into_response();
+        return Err(AppError::BadRequest("topic_id is required".to_string()));
     }
 
     // Execute both queries in parallel
@@ -30,40 +36,47 @@ pub async fn get_topic(
         EmailResult::get_result_counts_by_topic_id(&state.db_pool, &topic_id)
     );
 
-    let request_counts = match request_result {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to get request counts: {e:?}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve data").into_response();
-        }
-    };
+    let request_counts = request_result?;
+    let result_counts = result_result?;
 
-    let result_counts = match result_result {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to get result counts: {e:?}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to retrieve data").into_response();
-        }
-    };
-
-    let response = serde_json::json!({
-        "request_counts": request_counts,
-        "result_counts": result_counts,
-    });
-
-    (StatusCode::OK, Json(response)).into_response()
+    Ok(Json(TopicStatsResponse {
+        request_counts,
+        result_counts,
+    }))
 }
 
 /// Stops pending emails for a topic (only affects `Created` status).
 pub async fn stop_topic(
     State(state): State<AppState>,
     Path(topic_id): Path<String>,
-) -> impl IntoResponse {
-    match EmailRequest::stop_topic(&state.db_pool, &topic_id).await {
-        Ok(()) => (StatusCode::OK, "OK").into_response(),
-        Err(e) => {
-            error!("Failed to stop topic: {e:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to stop topic").into_response()
-        }
+) -> AppResult<impl IntoResponse> {
+    if topic_id.is_empty() {
+        return Err(AppError::BadRequest("topic_id is required".to_string()));
+    }
+
+    EmailRequest::stop_topic(&state.db_pool, &topic_id).await?;
+    Ok(Json(serde_json::json!({"status": "ok"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_topic_stats_response_serialization() {
+        let mut request_counts = std::collections::HashMap::new();
+        request_counts.insert("Sent".to_string(), 10);
+
+        let mut result_counts = std::collections::HashMap::new();
+        result_counts.insert("Delivery".to_string(), 8);
+
+        let response = TopicStatsResponse {
+            request_counts,
+            result_counts,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("request_counts"));
+        assert!(json.contains("result_counts"));
     }
 }

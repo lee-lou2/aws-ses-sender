@@ -4,9 +4,12 @@
 FROM rust:1.83-slim-bookworm AS builder
 
 # 빌드에 필요한 최소 의존성만 설치
+# - gcc, libc6-dev: mimalloc 빌드에 필요
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

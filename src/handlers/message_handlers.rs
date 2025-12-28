@@ -2,12 +2,13 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::{
+    error::{AppError, AppResult},
     models::{
         content::EmailContent,
         request::{EmailMessageStatus, EmailRequest},
@@ -50,15 +51,11 @@ pub struct CreateMessageResponse {
 pub async fn create_message(
     State(state): State<AppState>,
     Json(payload): Json<CreateMessageRequest>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     let start = std::time::Instant::now();
 
     if payload.messages.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "No messages provided"})),
-        )
-            .into_response();
+        return Err(AppError::BadRequest("No messages provided".to_string()));
     }
 
     let scheduled_at = payload.scheduled_at;
@@ -80,17 +77,7 @@ pub async fn create_message(
         })
         .collect();
 
-    let saved_contents = match EmailContent::save_batch(contents, &state.db_pool).await {
-        Ok(saved) => saved,
-        Err(e) => {
-            error!("Failed to save contents: {e:?}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "Failed to save content"})),
-            )
-                .into_response();
-        }
-    };
+    let saved_contents = EmailContent::save_batch(contents, &state.db_pool).await?;
 
     // 2. Create requests with content_id
     // Use Arc to share subject/content across all emails in the same message,
@@ -126,13 +113,9 @@ pub async fn create_message(
 
     if total > MAX_EMAILS_PER_REQUEST {
         warn!("Too many emails: {total} > {MAX_EMAILS_PER_REQUEST}");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("Max {MAX_EMAILS_PER_REQUEST} emails per request")
-            })),
-        )
-            .into_response();
+        return Err(AppError::BadRequest(format!(
+            "Max {MAX_EMAILS_PER_REQUEST} emails per request"
+        )));
     }
 
     info!("Processing {total} emails (scheduled={is_scheduled})");
@@ -194,17 +177,13 @@ pub async fn create_message(
     let duration = start.elapsed();
     info!("Done: {success} ok, {errors} err in {duration:?}");
 
-    (
-        StatusCode::OK,
-        Json(CreateMessageResponse {
-            total,
-            success,
-            errors,
-            duration_ms: duration.as_millis(),
-            scheduled: is_scheduled,
-        }),
-    )
-        .into_response()
+    Ok(Json(CreateMessageResponse {
+        total,
+        success,
+        errors,
+        duration_ms: duration.as_millis(),
+        scheduled: is_scheduled,
+    }))
 }
 
 /// Batch rollback requests to Created status when channel send fails.
@@ -224,4 +203,55 @@ async fn rollback_to_created(db_pool: &SqlitePool, ids: &[i32]) -> Result<(), sq
     }
     query.execute(db_pool).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_message_response_serialization() {
+        let response = CreateMessageResponse {
+            total: 100,
+            success: 98,
+            errors: 2,
+            duration_ms: 150,
+            scheduled: false,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"total\":100"));
+        assert!(json.contains("\"success\":98"));
+        assert!(json.contains("\"errors\":2"));
+    }
+
+    #[test]
+    fn test_message_deserialization() {
+        let json = r#"{
+            "topic_id": "topic-1",
+            "emails": ["test@example.com"],
+            "subject": "Hello",
+            "content": "<p>World</p>"
+        }"#;
+
+        let msg: Message = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.topic_id, Some("topic-1".to_string()));
+        assert_eq!(msg.emails.len(), 1);
+    }
+
+    #[test]
+    fn test_create_message_request_deserialization() {
+        let json = r#"{
+            "messages": [{
+                "emails": ["test@example.com"],
+                "subject": "Test",
+                "content": "Content"
+            }],
+            "scheduled_at": "2025-01-01 12:00:00"
+        }"#;
+
+        let req: CreateMessageRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        assert!(req.scheduled_at.is_some());
+    }
 }

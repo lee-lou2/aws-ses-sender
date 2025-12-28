@@ -13,7 +13,7 @@ use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
-use crate::config;
+use crate::config::APP_CONFIG;
 
 // Retry configuration
 const MAX_RETRIES: u32 = 3;
@@ -24,8 +24,7 @@ static SES_CLIENT: OnceCell<Client> = OnceCell::const_new();
 async fn get_ses_client() -> &'static Client {
     SES_CLIENT
         .get_or_init(|| async {
-            let envs = config::get_environments();
-            let region = &envs.aws_region;
+            let region = &APP_CONFIG.aws_region;
 
             let region_provider = RegionProviderChain::first_try(Region::new(region.clone()))
                 .or_default_provider()
@@ -140,5 +139,11 @@ mod tests {
 
         let err = SendEmailError::MaxRetriesExceeded("timeout".to_string());
         assert!(err.to_string().contains("Max retries exceeded"));
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        assert_eq!(MAX_RETRIES, 3);
+        assert_eq!(INITIAL_BACKOFF_MS, 100);
     }
 }

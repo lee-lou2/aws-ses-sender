@@ -52,4 +52,15 @@ mod tests {
         let response = health().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn test_health_response_body() {
+        use axum::body::to_bytes;
+
+        let response = health().await.into_response();
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("ok"));
+    }
 }

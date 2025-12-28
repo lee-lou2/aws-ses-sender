@@ -10,6 +10,7 @@ use serde_json::Value;
 use tracing::{error, info};
 
 use crate::{
+    error::{AppError, AppResult},
     models::{request::EmailRequest, result::EmailResult},
     state::AppState,
 };
@@ -92,59 +93,50 @@ pub async fn track_open(
 pub async fn get_sent_count(
     State(state): State<AppState>,
     Query(query): Query<SentCountQueryParams>,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     let hours = query.hours.unwrap_or(24);
-
-    match EmailRequest::sent_count(&state.db_pool, hours).await {
-        Ok(count) => (StatusCode::OK, Json(SentCountResponse { count })).into_response(),
-        Err(e) => {
-            error!("Failed to get sent count: {e:?}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to retrieve count",
-            )
-                .into_response()
-        }
-    }
+    let count = EmailRequest::sent_count(&state.db_pool, hours).await?;
+    Ok(Json(SentCountResponse { count }))
 }
 
 /// Handles AWS SNS events (Bounce, Complaint, Delivery, etc.).
 pub async fn handle_sns_event(
     State(state): State<AppState>,
     request: Request,
-) -> impl IntoResponse {
+) -> AppResult<impl IntoResponse> {
     let msg_type = request
         .headers()
         .get("x-amz-sns-message-type")
         .and_then(|v| v.to_str().ok());
 
     if !matches!(msg_type, Some("Notification" | "SubscriptionConfirmation")) {
-        error!("Invalid SNS message type");
-        return (StatusCode::BAD_REQUEST, "Invalid SNS Message Type").into_response();
+        return Err(AppError::BadRequest("Invalid SNS Message Type".to_string()));
     }
 
-    let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_BODY_SIZE).await else {
-        error!("Failed to read body");
-        return (StatusCode::BAD_REQUEST, "Failed to read body").into_response();
-    };
+    let body = axum::body::to_bytes(request.into_body(), MAX_BODY_SIZE)
+        .await
+        .map_err(|_| AppError::BadRequest("Failed to read body".to_string()))?;
 
-    let Ok(sns_msg) = serde_json::from_slice::<SnsMessage>(&body) else {
-        error!("Failed to parse SNS message");
-        return (StatusCode::BAD_REQUEST, "Failed to parse message").into_response();
-    };
+    let sns_msg: SnsMessage = serde_json::from_slice(&body)
+        .map_err(|_| AppError::BadRequest("Failed to parse message".to_string()))?;
 
     match sns_msg {
         SnsMessage::SubscriptionConfirmation { subscribe_url } => {
             info!("Subscription confirmation: {subscribe_url}");
-            (StatusCode::OK, "Subscription confirmation required").into_response()
+            Ok(Json(
+                serde_json::json!({"status": "subscription_confirmation_required"}),
+            ))
         }
         SnsMessage::Notification {
             message,
             message_id,
-        } => process_ses_notification(&state, &message, &message_id).await,
+        } => {
+            process_ses_notification(&state, &message, &message_id).await?;
+            Ok(Json(serde_json::json!({"status": "ok"})))
+        }
         SnsMessage::Other(_) => {
             info!("Other message type received");
-            (StatusCode::OK, "OK").into_response()
+            Ok(Json(serde_json::json!({"status": "ok"})))
         }
     }
 }
@@ -154,11 +146,9 @@ async fn process_ses_notification(
     state: &AppState,
     message: &str,
     sns_message_id: &str,
-) -> axum::response::Response {
-    let Ok(notification) = serde_json::from_str::<SesNotification>(message) else {
-        error!("Failed to parse SES notification");
-        return (StatusCode::OK, "Non-SES notification").into_response();
-    };
+) -> AppResult<()> {
+    let notification: SesNotification = serde_json::from_str(message)
+        .map_err(|_| AppError::BadRequest("Non-SES notification".to_string()))?;
 
     let ses_msg_id = notification
         .other_fields
@@ -166,19 +156,17 @@ async fn process_ses_notification(
         .and_then(|m| m.get("messageId"))
         .and_then(Value::as_str);
 
-    let Some(ses_msg_id) = ses_msg_id else {
+    let ses_msg_id = ses_msg_id.ok_or_else(|| {
         error!("SES message_id not found. SNS: {sns_message_id}");
-        return (StatusCode::BAD_REQUEST, "SES message_id not found").into_response();
-    };
+        AppError::BadRequest("SES message_id not found".to_string())
+    })?;
 
-    let request_id =
-        match EmailRequest::get_request_id_by_message_id(&state.db_pool, ses_msg_id).await {
-            Ok(id) => id,
-            Err(e) => {
-                error!("Request lookup failed. SES: {ses_msg_id}, Error: {e:?}");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Request not found").into_response();
-            }
-        };
+    let request_id = EmailRequest::get_request_id_by_message_id(&state.db_pool, ses_msg_id)
+        .await
+        .map_err(|e| {
+            error!("Request lookup failed. SES: {ses_msg_id}, Error: {e:?}");
+            AppError::NotFound("Request not found".to_string())
+        })?;
 
     let result = EmailResult {
         id: None,
@@ -187,11 +175,48 @@ async fn process_ses_notification(
         raw: Some(message.to_owned()),
     };
 
-    match result.save(&state.db_pool).await {
-        Ok(_) => (StatusCode::OK, "OK").into_response(),
-        Err(e) => {
-            error!("Failed to save event: {e:?}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Failed to save").into_response()
-        }
+    result.save(&state.db_pool).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tracking_pixel_is_valid_png() {
+        // PNG signature check
+        assert_eq!(
+            &TRACKING_PIXEL[0..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+    }
+
+    #[test]
+    fn test_sent_count_response_serialization() {
+        let response = SentCountResponse { count: 42 };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn test_open_query_params_deserialization() {
+        let json = r#"{"request_id": "123"}"#;
+        let params: OpenQueryParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.request_id, Some("123".to_string()));
+    }
+
+    #[test]
+    fn test_sns_message_notification_deserialization() {
+        let json = r#"{"Message": "test", "MessageId": "msg-123"}"#;
+        let msg: SnsMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, SnsMessage::Notification { .. }));
+    }
+
+    #[test]
+    fn test_sns_message_subscription_confirmation_deserialization() {
+        let json = r#"{"SubscribeURL": "https://example.com/confirm"}"#;
+        let msg: SnsMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, SnsMessage::SubscriptionConfirmation { .. }));
     }
 }

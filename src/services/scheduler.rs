@@ -150,3 +150,22 @@ async fn fetch_and_process_batch(
 
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scheduler_error_display() {
+        let err = SchedulerError::ChannelClosed;
+        assert_eq!(err.to_string(), "Send channel closed");
+    }
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(BATCH_SIZE, 1000);
+        assert_eq!(IDLE_DELAY_SECS, 10);
+        assert_eq!(BATCH_DELAY_MS, 100);
+        assert_eq!(ERROR_BACKOFF_SECS, 5);
+    }
+}

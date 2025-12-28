@@ -80,6 +80,7 @@ impl EmailRequest {
     /// Saves a single email request (use `save_batch` for bulk inserts).
     /// Note: `content_id` must be set before calling this method.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn save(self, db_pool: &SqlitePool) -> Result<Self, sqlx::Error> {
         let scheduled_at = parse_scheduled_at(self.scheduled_at.as_deref());
 
