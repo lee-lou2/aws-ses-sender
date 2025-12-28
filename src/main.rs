@@ -120,8 +120,15 @@ async fn init_database() -> Result<sqlx::SqlitePool, Box<dyn std::error::Error>>
         .connect("sqlite://sqlite3.db?mode=rwc")
         .await?;
 
+    run_migrations(&pool).await?;
     apply_sqlite_optimizations(&pool).await?;
     Ok(pool)
+}
+
+async fn run_migrations(pool: &sqlx::SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::migrate!("./migrations").run(pool).await?;
+    info!("Database migrations applied");
+    Ok(())
 }
 
 async fn apply_sqlite_optimizations(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {

@@ -52,41 +52,44 @@
 ## 📁 Project Structure
 
 ```
-src/
-├── main.rs                 # Entry point, initialization, graceful shutdown
-├── app.rs                  # Axum router setup
-├── config.rs               # Environment variable loading (singleton)
-├── constants.rs            # Shared constants (BATCH_INSERT_SIZE)
-├── state.rs                # AppState definition (DB pool, channels)
-├── handlers/               # HTTP request handlers
-│   ├── mod.rs
-│   ├── message_handlers.rs # POST /v1/messages
-│   ├── event_handlers.rs   # GET/POST /v1/events/*
-│   ├── health_handlers.rs  # GET /health, /ready
-│   └── topic_handlers.rs   # GET/DELETE /v1/topics/{id}
-├── services/               # Background services
-│   ├── mod.rs
-│   ├── scheduler.rs        # Scheduled email polling (10-second interval)
-│   ├── receiver.rs         # Rate-limited sending + batch DB updates
-│   └── sender.rs           # AWS SES API calls (singleton client, retry logic)
-├── models/                 # Data models
-│   ├── mod.rs
-│   ├── content.rs          # EmailContent (subject, content storage)
-│   ├── request.rs          # EmailRequest, EmailMessageStatus
-│   └── result.rs           # EmailResult
-├── middlewares/            # HTTP middlewares
-│   ├── mod.rs
-│   └── auth_middlewares.rs # API Key authentication
-└── tests/                  # Tests
-    ├── mod.rs              # Shared helper functions
-    ├── auth_tests.rs
-    ├── event_tests.rs
-    ├── handler_tests.rs
-    ├── health_tests.rs
-    ├── request_tests.rs
-    ├── scheduler_tests.rs
-    ├── status_tests.rs
-    └── topic_tests.rs
+├── migrations/             # SQLx database migrations (auto-applied on startup)
+│   └── 20241228000000_initial_schema.sql
+├── src/
+│   ├── main.rs                 # Entry point, migrations, graceful shutdown
+│   ├── app.rs                  # Axum router setup
+│   ├── config.rs               # Environment variable loading (singleton)
+│   ├── constants.rs            # Shared constants (BATCH_INSERT_SIZE)
+│   ├── state.rs                # AppState definition (DB pool, channels)
+│   ├── handlers/               # HTTP request handlers
+│   │   ├── mod.rs
+│   │   ├── message_handlers.rs # POST /v1/messages
+│   │   ├── event_handlers.rs   # GET/POST /v1/events/*
+│   │   ├── health_handlers.rs  # GET /health, /ready
+│   │   └── topic_handlers.rs   # GET/DELETE /v1/topics/{id}
+│   ├── services/               # Background services
+│   │   ├── mod.rs
+│   │   ├── scheduler.rs        # Scheduled email polling (10-second interval)
+│   │   ├── receiver.rs         # Rate-limited sending + batch DB updates
+│   │   └── sender.rs           # AWS SES API calls (singleton client, retry logic)
+│   ├── models/                 # Data models
+│   │   ├── mod.rs
+│   │   ├── content.rs          # EmailContent (subject, content storage)
+│   │   ├── request.rs          # EmailRequest, EmailMessageStatus
+│   │   └── result.rs           # EmailResult
+│   ├── middlewares/            # HTTP middlewares
+│   │   ├── mod.rs
+│   │   └── auth_middlewares.rs # API Key authentication
+│   └── tests/                  # Tests
+│       ├── mod.rs              # Shared helper functions
+│       ├── auth_tests.rs
+│       ├── event_tests.rs
+│       ├── handler_tests.rs
+│       ├── health_tests.rs
+│       ├── request_tests.rs
+│       ├── scheduler_tests.rs
+│       ├── status_tests.rs
+│       └── topic_tests.rs
+└── Cargo.toml
 ```
 
 ---
@@ -96,6 +99,7 @@ src/
 ### `src/main.rs`
 - Application entry point
 - Logger, Sentry, DB initialization
+- SQLx migrations auto-applied via `sqlx::migrate!()`
 - Spawns 3 background tasks
 - Graceful shutdown with `tokio::signal::ctrl_c()`
 
@@ -216,7 +220,7 @@ pub enum EmailMessageStatus {
 ### Build and Run
 
 ```bash
-# Development mode
+# Development mode (migrations auto-applied)
 cargo run
 
 # Release mode
@@ -228,6 +232,21 @@ cargo test
 # Linting
 cargo clippy
 cargo fmt
+```
+
+### Database Migrations
+
+Migrations are automatically applied on server startup via `sqlx::migrate!()`.
+
+```bash
+# Install SQLx CLI (optional, for manual migration management)
+cargo install sqlx-cli --no-default-features --features native-tls,sqlite
+
+# Create new migration
+sqlx migrate add <description>
+
+# Check migration status
+sqlx migrate info
 ```
 
 ### Key Constants

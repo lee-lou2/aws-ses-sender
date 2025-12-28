@@ -343,16 +343,15 @@ erDiagram
 ## Quick Start
 
 ```bash
-# Initialize database
-./init_database.sh
-
-# Run server
+# Run server (migrations auto-applied)
 cargo run --release
 
 # Docker
 docker build -t ses-sender .
 docker run -p 3000:3000 --env-file .env ses-sender
 ```
+
+> Database migrations are automatically applied on server startup (`migrations/` folder)
 
 ---
 

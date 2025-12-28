@@ -343,16 +343,15 @@ erDiagram
 ## 빠른 시작
 
 ```bash
-# 데이터베이스 초기화
-./init_database.sh
-
-# 서버 실행
+# 서버 실행 (마이그레이션 자동 적용)
 cargo run --release
 
 # Docker
 docker build -t ses-sender .
 docker run -p 3000:3000 --env-file .env ses-sender
 ```
+
+> 데이터베이스 마이그레이션은 서버 시작 시 자동으로 적용됩니다 (`migrations/` 폴더)
 
 ---
 
