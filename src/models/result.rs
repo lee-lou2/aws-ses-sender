@@ -101,7 +101,7 @@ mod tests {
         .await
         .unwrap();
 
-        // 인덱스 추가
+        // Add indexes
         sqlx::query("CREATE INDEX idx_requests_topic_id ON email_requests(topic_id)")
             .execute(&pool)
             .await

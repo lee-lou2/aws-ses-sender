@@ -1,4 +1,4 @@
-//! 환경 변수 설정 모듈.
+//! Environment variable configuration module.
 
 use std::env;
 use std::sync::{LazyLock, Once};

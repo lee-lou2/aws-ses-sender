@@ -27,7 +27,7 @@ pub mod helpers {
             .await
             .unwrap();
 
-        // email_contents 테이블
+        // email_contents table
         sqlx::query(
             "CREATE TABLE email_contents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,7 +40,7 @@ pub mod helpers {
         .await
         .unwrap();
 
-        // email_requests 테이블 (content_id FK 참조)
+        // email_requests table (references content_id FK)
         sqlx::query(
             "CREATE TABLE email_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,7 +75,7 @@ pub mod helpers {
         .await
         .unwrap();
 
-        // 개별 인덱스
+        // Individual indexes
         sqlx::query("CREATE INDEX idx_requests_topic_id ON email_requests(topic_id)")
             .execute(&pool)
             .await
@@ -91,7 +91,7 @@ pub mod helpers {
             .await
             .unwrap();
 
-        // 복합 인덱스: 스케줄러 쿼리 최적화
+        // Composite index: scheduler query optimization
         sqlx::query(
             "CREATE INDEX idx_requests_status_scheduled ON email_requests(status, scheduled_at)",
         )
@@ -99,7 +99,7 @@ pub mod helpers {
         .await
         .unwrap();
 
-        // 복합 인덱스: 발송 건수 조회 최적화
+        // Composite index: sent count query optimization
         sqlx::query(
             "CREATE INDEX idx_requests_status_created ON email_requests(status, created_at)",
         )
@@ -107,13 +107,13 @@ pub mod helpers {
         .await
         .unwrap();
 
-        // 복합 인덱스: stop_topic 쿼리 최적화
+        // Composite index: stop_topic query optimization
         sqlx::query("CREATE INDEX idx_requests_status_topic ON email_requests(status, topic_id)")
             .execute(&pool)
             .await
             .unwrap();
 
-        // email_results 인덱스
+        // email_results indexes
         sqlx::query("CREATE INDEX idx_results_request_id ON email_results(request_id)")
             .execute(&pool)
             .await

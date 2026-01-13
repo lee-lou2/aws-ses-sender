@@ -1,4 +1,4 @@
-//! 애플리케이션 상태 모듈.
+//! Application state module.
 
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;

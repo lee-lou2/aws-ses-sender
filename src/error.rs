@@ -1,4 +1,4 @@
-//! 중앙화된 에러 처리 모듈.
+//! Centralized error handling module.
 
 use axum::{
     http::StatusCode,

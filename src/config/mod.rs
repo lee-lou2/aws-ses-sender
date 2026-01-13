@@ -1,4 +1,4 @@
-//! 설정 모듈.
+//! Configuration module.
 
 mod db;
 mod env;

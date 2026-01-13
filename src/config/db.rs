@@ -1,4 +1,4 @@
-//! 데이터베이스 연결 관리 모듈.
+//! Database connection management module.
 
 use std::time::Duration;
 
